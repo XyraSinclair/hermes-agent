@@ -23,6 +23,7 @@ import tempfile
 import time
 import uuid
 import textwrap
+import asyncio
 from contextlib import contextmanager
 from pathlib import Path
 from datetime import datetime
@@ -1865,6 +1866,34 @@ class HermesCLI:
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
 
+        # Gateway already exposes an event-hook system around agent:start/end.
+        # Load the same hook registry for CLI sessions so end-of-turn automation
+        # can steward terminal chats too.
+        self.hooks = None
+        try:
+            from gateway.hooks import HookRegistry
+            self.hooks = HookRegistry()
+            self.hooks.discover_and_load()
+        except Exception as e:
+            logger.debug("Failed to initialize CLI hooks: %s", e)
+            self.hooks = None
+
+        self._auto_steward_depth = 0
+        _auto_steward_cfg = (CLI_CONFIG.get("agent", {}) or {}).get("auto_steward", {}) or {}
+        _auto_steward_enabled = _auto_steward_cfg.get("enabled", os.getenv("HERMES_AUTO_STEWARD", ""))
+        self._auto_steward_enabled = str(_auto_steward_enabled).strip().lower() in (
+            "1", "true", "yes", "y", "on"
+        )
+        try:
+            _max_hops_raw = _auto_steward_cfg.get("max_hops", os.getenv("HERMES_AUTO_STEWARD_MAX_HOPS", "1"))
+            self._auto_steward_max_hops = max(0, int(_max_hops_raw))
+        except Exception:
+            self._auto_steward_max_hops = 1
+        _notice_raw = _auto_steward_cfg.get("notice", os.getenv("HERMES_AUTO_STEWARD_NOTICE", "1"))
+        self._auto_steward_notice = str(_notice_raw).strip().lower() not in (
+            "0", "false", "no", "off"
+        )
+
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
         import time as _time
@@ -1872,6 +1901,106 @@ class HermesCLI:
         if hasattr(self, "_app") and self._app and (now - self._last_invalidate) >= min_interval:
             self._last_invalidate = now
             self._app.invalidate()
+
+    def _emit_hook_sync(self, event_type: str, context: Optional[Dict[str, Any]] = None) -> None:
+        """Best-effort synchronous hook emission for CLI turns."""
+        if not getattr(self, "hooks", None):
+            return
+        payload = dict(context or {})
+        try:
+            try:
+                asyncio.run(self.hooks.emit(event_type, payload))
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                try:
+                    loop.run_until_complete(self.hooks.emit(event_type, payload))
+                finally:
+                    loop.close()
+        except Exception as e:
+            logger.debug("CLI hook emit failed for %s: %s", event_type, e)
+
+    @staticmethod
+    def _response_requires_user_input(response: str) -> bool:
+        text = (response or "").strip().lower()
+        if not text:
+            return True
+        hard_blockers = (
+            "cannot proceed without",
+            "can't proceed without",
+            "need your approval",
+            "need your confirmation",
+            "requires your approval",
+            "requires your confirmation",
+            "please provide",
+            "i need your",
+            "need you to",
+            "waiting for your",
+            "what would you like",
+            "which option",
+            "which would you like",
+            "which do you want",
+            "do you want me to",
+            "would you like me to",
+            "let me know if you'd like",
+            "let me know if you want",
+            "please choose",
+            "need clarification",
+        )
+        if any(needle in text for needle in hard_blockers):
+            return True
+        question_mark = "?" in text
+        soft_questions = (
+            "should i",
+            "can you provide",
+            "do you want",
+            "would you like",
+            "what should i",
+            "which one",
+        )
+        return question_mark and any(needle in text for needle in soft_questions)
+
+    @staticmethod
+    def _response_looks_terminal(response: str) -> bool:
+        text = (response or "").strip().lower()
+        if not text:
+            return False
+        terminal_markers = (
+            "stopping because",
+            "remaining: none",
+            "remaining: no concrete task",
+            "remaining: none specified",
+            "blocked: waiting on a real objective",
+            "no further concrete task",
+            "nothing further i can safely",
+            "no specific executable task",
+            "no concrete executable task",
+            "work is complete",
+            "prior request already completed exactly as asked",
+        )
+        return any(marker in text for marker in terminal_markers)
+
+    def _build_auto_steward_prompt(self) -> str:
+        return (
+            "This is an automated stewardship followthrough message. Reassess the conversation from the perspective of the user's overall strategic intent, not just the last sentence. "
+            "Do you understand the overall intent? Does it overall seem safe to continue right now? You have a tendency to stop too early, so if the intent is clear and the next steps are obvious and safe, actually continue and do them now. "
+            "Before acting, briefly state done / remaining / blocked in <=5 lines. Then continue exhaustively through the highest-leverage safe next steps available from the current context. "
+            "Do not stop merely to narrate, summarize, or offer obvious next steps. Only stop when the work is genuinely complete, concretely blocked, or requires non-retrievable user input. If you stop, say why in one sentence."
+        )
+
+    def _should_auto_steward(self, response: str, result: Optional[Dict[str, Any]] = None) -> bool:
+        if not self._auto_steward_enabled:
+            return False
+        if self._auto_steward_depth >= self._auto_steward_max_hops:
+            return False
+        if not response or not str(response).strip():
+            return False
+        if result and (result.get("failed") or result.get("partial") or result.get("interrupted")):
+            return False
+        if self._response_requires_user_input(response):
+            return False
+        if self._response_looks_terminal(response):
+            return False
+        return True
 
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
         if percent_used is None:
@@ -7824,6 +7953,13 @@ class HermesCLI:
                     "2-3 sentences max. No code blocks or markdown.] "
                 )
 
+            hook_ctx = {
+                "platform": "cli",
+                "session_id": self.session_id,
+                "message": str(message)[:500],
+            }
+            self._emit_hook_sync("agent:start", hook_ctx)
+
             def run_agent():
                 nonlocal result
                 agent_message = _voice_prefix + message if _voice_prefix else message
@@ -8087,6 +8223,21 @@ class HermesCLI:
                     daemon=True,
                 ).start()
 
+            self._emit_hook_sync("agent:end", {
+                **hook_ctx,
+                "response": str(response or "")[:500],
+            })
+
+            if not pending_message and self._should_auto_steward(response, result):
+                if self._auto_steward_notice:
+                    _cprint(f"\n{_DIM}⤷ auto-steward: continuing with an extra bounded followthrough turn...{_RST}")
+                self._auto_steward_depth += 1
+                try:
+                    followthrough_response = self.chat(self._build_auto_steward_prompt())
+                    if followthrough_response is not None:
+                        return followthrough_response
+                finally:
+                    self._auto_steward_depth = max(0, self._auto_steward_depth - 1)
 
             # Re-queue the interrupt message (and any that arrived while we were
             # processing the first) as the next prompt for process_loop.

@@ -479,6 +479,7 @@ class CredentialPool:
                     entry,
                     access_token=cli_access,
                     refresh_token=cli_refresh,
+                    last_refresh=datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
                     last_status=None,
                     last_status_at=None,
                     last_error_code=None,
@@ -793,9 +794,7 @@ class CredentialPool:
             # For openai-codex entries, sync from ~/.codex/auth.json before
             # any status/refresh checks.  This picks up tokens refreshed by
             # the Codex CLI or another Hermes profile.
-            if (self.provider == "openai-codex"
-                    and entry.last_status == STATUS_EXHAUSTED
-                    and entry.refresh_token):
+            if self.provider == "openai-codex" and entry.refresh_token:
                 synced = self._sync_codex_entry_from_cli(entry)
                 if synced is not entry:
                     entry = synced

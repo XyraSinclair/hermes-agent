@@ -673,6 +673,29 @@ class GatewayRunner:
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
 
+        # Auto-steward followthrough for gateway chats.
+        try:
+            import yaml as _as_yaml
+            with open(_config_path, encoding="utf-8") as _as_f:
+                _as_cfg = _as_yaml.safe_load(_as_f) or {}
+        except Exception:
+            _as_cfg = {}
+        _auto_steward_cfg = (_as_cfg.get("agent") or {}).get("auto_steward", {}) or {}
+        _auto_steward_enabled = _auto_steward_cfg.get("enabled", os.getenv("HERMES_AUTO_STEWARD", ""))
+        self._auto_steward_enabled = str(_auto_steward_enabled).strip().lower() in (
+            "1", "true", "yes", "y", "on"
+        )
+        try:
+            _max_hops_raw = _auto_steward_cfg.get("max_hops", os.getenv("HERMES_AUTO_STEWARD_MAX_HOPS", "1"))
+            self._auto_steward_max_hops = max(0, int(_max_hops_raw))
+        except Exception:
+            self._auto_steward_max_hops = 1
+        _notice_raw = _auto_steward_cfg.get("notice", os.getenv("HERMES_AUTO_STEWARD_NOTICE", "1"))
+        self._auto_steward_notice = str(_notice_raw).strip().lower() not in (
+            "0", "false", "no", "off"
+        )
+        self._auto_steward_depths: Dict[str, int] = {}
+
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
 
@@ -717,6 +740,89 @@ class GatewayRunner:
             )
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
+
+    @staticmethod
+    def _response_requires_user_input(response: str) -> bool:
+        text = (response or "").strip().lower()
+        if not text:
+            return True
+        hard_blockers = (
+            "cannot proceed without",
+            "can't proceed without",
+            "need your approval",
+            "need your confirmation",
+            "requires your approval",
+            "requires your confirmation",
+            "please provide",
+            "i need your",
+            "need you to",
+            "waiting for your",
+            "what would you like",
+            "which option",
+            "which would you like",
+            "which do you want",
+            "do you want me to",
+            "would you like me to",
+            "let me know if you'd like",
+            "let me know if you want",
+            "please choose",
+            "need clarification",
+        )
+        if any(needle in text for needle in hard_blockers):
+            return True
+        question_mark = "?" in text
+        soft_questions = (
+            "should i",
+            "can you provide",
+            "do you want",
+            "would you like",
+            "what should i",
+            "which one",
+        )
+        return question_mark and any(needle in text for needle in soft_questions)
+
+    @staticmethod
+    def _response_looks_terminal(response: str) -> bool:
+        text = (response or "").strip().lower()
+        if not text:
+            return False
+        terminal_markers = (
+            "stopping because",
+            "remaining: none",
+            "remaining: no concrete task",
+            "remaining: none specified",
+            "blocked: waiting on a real objective",
+            "no further concrete task",
+            "nothing further i can safely",
+            "no specific executable task",
+            "no concrete executable task",
+            "work is complete",
+            "prior request already completed exactly as asked",
+        )
+        return any(marker in text for marker in terminal_markers)
+
+    def _build_auto_steward_prompt(self) -> str:
+        return (
+            "This is an automated stewardship followthrough message. Reassess the conversation from the perspective of the user's overall strategic intent, not just the last sentence. "
+            "Do you understand the overall intent? Does it overall seem safe to continue right now? You have a tendency to stop too early, so if the intent is clear and the next steps are obvious and safe, actually continue and do them now. "
+            "Before acting, briefly state done / remaining / blocked in <=5 lines. Then continue exhaustively through the highest-leverage safe next steps available from the current context. "
+            "Do not stop merely to narrate, summarize, or offer obvious next steps. Only stop when the work is genuinely complete, concretely blocked, or requires non-retrievable user input. If you stop, say why in one sentence."
+        )
+
+    def _should_auto_steward(self, response: str, result: Optional[Dict[str, Any]] = None, *, session_key: str = "") -> bool:
+        if not self._auto_steward_enabled:
+            return False
+        if self._auto_steward_depths.get(session_key, 0) >= self._auto_steward_max_hops:
+            return False
+        if not response or not str(response).strip():
+            return False
+        if result and (result.get("failed") or result.get("partial") or result.get("interrupted")):
+            return False
+        if self._response_requires_user_input(response):
+            return False
+        if self._response_looks_terminal(response):
+            return False
+        return True
 
     def _set_adapter_auto_tts_disabled(self, adapter, chat_id: str, disabled: bool) -> None:
         """Update an adapter's in-memory auto-TTS suppression set if present."""
@@ -4171,6 +4277,43 @@ class GatewayRunner:
             # post-processing in _process_message_background is skipped
             # when already_sent is True, so media files would never be
             # delivered without this.
+            if self._should_auto_steward(response, agent_result, session_key=session_key):
+                adapter = self.adapters.get(source.platform)
+                if self._auto_steward_notice:
+                    logger.info(
+                        "auto-steward continuing session %s (depth=%d/%d)",
+                        session_key,
+                        self._auto_steward_depths.get(session_key, 0) + 1,
+                        self._auto_steward_max_hops,
+                    )
+                if response and not agent_result.get("already_sent") and adapter:
+                    try:
+                        await adapter.send(source.chat_id, response, metadata=getattr(event, "metadata", None))
+                    except Exception as e:
+                        logger.warning("Failed to send pre-followthrough response: %s", e)
+                elif agent_result.get("already_sent") and response:
+                    _media_adapter = self.adapters.get(source.platform)
+                    if _media_adapter:
+                        await self._deliver_media_from_response(response, event, _media_adapter)
+
+                from gateway.platforms.base import MessageEvent, MessageType
+                follow_event = MessageEvent(
+                    text=self._build_auto_steward_prompt(),
+                    message_type=MessageType.TEXT,
+                    source=source,
+                    raw_message={"auto_steward": True},
+                    message_id=f"auto-steward-{uuid.uuid4().hex[:10]}",
+                )
+                self._auto_steward_depths[session_key] = self._auto_steward_depths.get(session_key, 0) + 1
+                try:
+                    return await self._handle_message_with_agent(follow_event, source, _quick_key)
+                finally:
+                    new_depth = max(0, self._auto_steward_depths.get(session_key, 1) - 1)
+                    if new_depth:
+                        self._auto_steward_depths[session_key] = new_depth
+                    else:
+                        self._auto_steward_depths.pop(session_key, None)
+
             #
             # Never skip when the agent failed — the error message is new
             # content the user hasn't seen (streaming only sent earlier

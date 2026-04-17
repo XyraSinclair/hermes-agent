@@ -1461,6 +1461,74 @@ def _save_codex_tokens(tokens: Dict[str, str], last_refresh: str = None) -> None
         _save_auth_store(auth_store)
 
 
+def _get_codex_pool_entry() -> Tuple[Optional[Any], Optional[Any]]:
+    """Return the current Codex credential-pool entry when available."""
+    try:
+        from agent.credential_pool import load_pool
+    except Exception as exc:
+        logger.debug("Could not import Codex credential pool: %s", exc)
+        return None, None
+
+    try:
+        pool = load_pool("openai-codex")
+    except Exception as exc:
+        logger.debug("Could not load Codex credential pool: %s", exc)
+        return None, None
+
+    if not pool or not pool.has_credentials():
+        return None, None
+
+    try:
+        entry = pool.current() or pool.select()
+    except Exception as exc:
+        logger.debug("Could not select Codex credential pool entry: %s", exc)
+        return None, None
+
+    if entry is None:
+        return None, None
+    return pool, entry
+
+
+def _codex_pool_entry_payload(entry: Any) -> Optional[Dict[str, Any]]:
+    """Normalize a pooled Codex credential into the runtime token payload shape."""
+    access_token = str(
+        getattr(entry, "runtime_api_key", None)
+        or getattr(entry, "access_token", "")
+        or ""
+    ).strip()
+    refresh_token = str(getattr(entry, "refresh_token", "") or "").strip()
+    if not access_token or not refresh_token:
+        return None
+
+    label = str(getattr(entry, "label", "") or getattr(entry, "id", "unknown")).strip() or "unknown"
+    return {
+        "tokens": {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+        },
+        "last_refresh": getattr(entry, "last_refresh", None),
+        "source": f"credential-pool:{label}",
+    }
+
+
+def _codex_runtime_credentials_from_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the runtime credential response from a normalized token payload."""
+    tokens = dict(payload.get("tokens") or {})
+    access_token = str(tokens.get("access_token", "") or "").strip()
+    base_url = (
+        os.getenv("HERMES_CODEX_BASE_URL", "").strip().rstrip("/")
+        or DEFAULT_CODEX_BASE_URL
+    )
+    return {
+        "provider": "openai-codex",
+        "base_url": base_url,
+        "api_key": access_token,
+        "source": str(payload.get("source") or "hermes-auth-store"),
+        "last_refresh": payload.get("last_refresh"),
+        "auth_mode": "chatgpt",
+    }
+
+
 def refresh_codex_oauth_pure(
     access_token: str,
     refresh_token: str,
@@ -1618,14 +1686,58 @@ def resolve_codex_runtime_credentials(
     refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
 ) -> Dict[str, Any]:
-    """Resolve runtime credentials from Hermes's own Codex token store."""
+    """Resolve runtime credentials from Hermes's Codex auth state.
+
+    The credential pool is authoritative when it has a usable entry because
+    `hermes auth` writes there and the pool already knows how to resync from
+    the Codex CLI when refresh-token rotation happens elsewhere.
+    """
+    pool, pool_entry = _get_codex_pool_entry()
+    pool_payload = _codex_pool_entry_payload(pool_entry) if pool_entry is not None else None
+    data: Optional[Dict[str, Any]] = None
+    read_error: Optional[AuthError] = None
     try:
         data = _read_codex_tokens()
-    except AuthError as orig_err:
-        # Only attempt migration when there are NO tokens stored at all
-        # (code == "codex_auth_missing"), not when tokens exist but are invalid.
-        if orig_err.code != "codex_auth_missing":
-            raise
+    except AuthError as exc:
+        read_error = exc
+
+    if pool_payload is not None:
+        stored_tokens = dict(data.get("tokens") or {}) if data is not None else {}
+        pool_tokens = dict(pool_payload["tokens"])
+        pool_differs = (
+            stored_tokens.get("access_token") != pool_tokens.get("access_token")
+            or stored_tokens.get("refresh_token") != pool_tokens.get("refresh_token")
+        )
+        if pool_differs:
+            _save_codex_tokens(pool_tokens, pool_payload.get("last_refresh"))
+            return _codex_runtime_credentials_from_payload(pool_payload)
+        elif force_refresh and pool is not None:
+            refreshed_entry = pool.try_refresh_current()
+            refreshed_payload = _codex_pool_entry_payload(refreshed_entry) if refreshed_entry is not None else None
+            if refreshed_payload is not None:
+                _save_codex_tokens(
+                    refreshed_payload["tokens"],
+                    refreshed_payload.get("last_refresh"),
+                )
+                return _codex_runtime_credentials_from_payload(refreshed_payload)
+            raise AuthError(
+                "Codex credential refresh failed. Run `hermes auth` to re-authenticate.",
+                provider="openai-codex",
+                code="codex_refresh_failed",
+                relogin_required=True,
+            )
+        return _codex_runtime_credentials_from_payload(pool_payload)
+
+    if data is None:
+        if read_error is None:
+            raise AuthError(
+                "No Codex credentials stored. Run `hermes auth` to authenticate.",
+                provider="openai-codex",
+                code="codex_auth_missing",
+                relogin_required=True,
+            )
+        if read_error.code != "codex_auth_missing":
+            raise read_error
 
         # Migration: user had Codex as active provider with old storage (~/.codex/).
         cli_tokens = _import_codex_cli_tokens()
@@ -1637,7 +1749,8 @@ def resolve_codex_runtime_credentials(
             _save_codex_tokens(cli_tokens)
             data = _read_codex_tokens()
         else:
-            raise
+            raise read_error
+
     tokens = dict(data["tokens"])
     access_token = str(tokens.get("access_token", "") or "").strip()
     refresh_timeout_seconds = float(os.getenv("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", "20"))
