@@ -52,6 +52,11 @@ class TestCLIAutoSteward:
             {"failed": True, "partial": False, "interrupted": False},
         )
 
+    def test_response_looks_terminal_for_bare_stopping_colon(self):
+        assert HermesCLI._response_looks_terminal(
+            "Fix landed. Stopping: the feature is complete and remaining moves are preference calls."
+        )
+
     def test_response_looks_terminal_for_completion_language(self):
         assert HermesCLI._response_looks_terminal(
             "Done: prior request already completed exactly as asked. Remaining: none. Stopping because the work is complete."

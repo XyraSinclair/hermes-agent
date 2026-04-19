@@ -930,6 +930,9 @@ class GatewayRunner:
             return False
         terminal_markers = (
             "stopping because",
+            "stopping: ",
+            "stopping —",
+            "stopping -",
             "remaining: none",
             "remaining: no concrete task",
             "remaining: none specified",
