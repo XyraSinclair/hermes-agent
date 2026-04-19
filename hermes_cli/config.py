@@ -376,6 +376,19 @@ DEFAULT_CONFIG = {
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
         "gateway_notify_interval": 600,
+        # End-of-turn self-followthrough. When enabled, the CLI and gateway
+        # may re-enter themselves once per user turn with a reassessment
+        # prompt so obvious safe next steps get done instead of stopping
+        # mid-task. Gated by `opt_in_token` so it only fires when the
+        # user's message contains that literal substring. Set
+        # `opt_in_token: ""` to disable gating (steward every non-terminal
+        # turn, legacy behavior).
+        "auto_steward": {
+            "enabled": False,
+            "max_hops": 1,
+            "notice": True,
+            "opt_in_token": "\t",
+        },
     },
     
     "terminal": {
