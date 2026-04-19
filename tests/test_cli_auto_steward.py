@@ -11,6 +11,11 @@ class TestCLIAutoSteward:
         cli._auto_steward_armed = armed
         return cli
 
+    def test_response_requires_user_input_for_want_me_to(self):
+        assert HermesCLI._response_requires_user_input(
+            "Feature is done. Want me to switch the default token to something visible?"
+        )
+
     def test_response_requires_user_input_for_confirmation_prompt(self):
         assert HermesCLI._response_requires_user_input(
             "I can keep going, but would you like me to deploy this now?"

@@ -2147,6 +2147,7 @@ class HermesCLI:
             "which would you like",
             "which do you want",
             "do you want me to",
+            "want me to",
             "would you like me to",
             "let me know if you'd like",
             "let me know if you want",
