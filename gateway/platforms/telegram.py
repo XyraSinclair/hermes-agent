@@ -765,17 +765,13 @@ class TelegramAdapter(BasePlatformAdapter):
             self._app.add_handler(CallbackQueryHandler(self._handle_callback_query))
             
             # Start polling — retry initialize() for transient TLS resets
-            try:
-                from telegram.error import NetworkError, TimedOut
-            except ImportError:
-                NetworkError = TimedOut = OSError  # type: ignore[misc,assignment]
             _max_connect = 8
             for _attempt in range(_max_connect):
                 try:
                     await self._app.initialize()
                     break
-                except (NetworkError, TimedOut, OSError) as init_err:
-                    if _attempt < _max_connect - 1:
+                except Exception as init_err:
+                    if self._is_retryable_network_error(init_err) and _attempt < _max_connect - 1:
                         wait = min(2 ** _attempt, 15)
                         logger.warning(
                             "[%s] Connect attempt %d/%d failed: %s — retrying in %ds",

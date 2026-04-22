@@ -379,15 +379,39 @@ DEFAULT_CONFIG = {
         # End-of-turn self-followthrough. When enabled, the CLI and gateway
         # may re-enter themselves once per user turn with a reassessment
         # prompt so obvious safe next steps get done instead of stopping
-        # mid-task. Gated by `opt_in_token` so it only fires when the
-        # user's message contains that literal substring. Set
-        # `opt_in_token: ""` to disable gating (steward every non-terminal
-        # turn, legacy behavior).
+        # mid-task. When opt-in is required, operator-authored `/as` arms
+        # stewardship with default_hops_when_armed and `/asN` overrides the
+        # hop cap for that message up to hard_cap_hops. Set
+        # `opt_in_required: false` (or `opt_in_token: ""`) to steward every
+        # non-terminal turn.
         "auto_steward": {
             "enabled": False,
             "max_hops": 1,
             "notice": True,
-            "opt_in_token": "\t",
+            # Printable in-band operator suffix. `/as` uses default_hops_when_armed;
+            # `/asN` overrides it per message up to hard_cap_hops.
+            "opt_in_token": "/as",
+            "opt_in_required": True,
+            "default_hops_when_armed": 1,
+            "hard_cap_hops": 1,
+            "decision_mode": "heuristic",
+            "low_progress_patience": 2,
+            "done_threshold": 0.80,
+            "continue_threshold": 0.45,
+            "stop_threshold": 0.30,
+            "redirect_margin": 0.20,
+            "review_enabled": False,
+            "review_on_user_input_boundary": True,
+            "review_provider": "anthropic",
+            "review_model": "claude-opus-4.6",
+            "review_base_url": "",
+            "review_api_key": "",
+            "review_timeout": 45,
+            "review_min_confidence": 0.75,
+            "review_start_hop": 3,
+            "review_band": 0.10,
+            "max_reviews_per_episode": 2,
+            "log_episodes": True,
         },
     },
     

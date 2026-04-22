@@ -1,3 +1,9 @@
+from types import SimpleNamespace
+from unittest.mock import MagicMock
+
+import pytest
+
+import cli as cli_mod
 from cli import HermesCLI
 
 
@@ -24,6 +30,11 @@ class TestCLIAutoSteward:
     def test_response_requires_user_input_for_missing_credentials(self):
         assert HermesCLI._response_requires_user_input(
             "I cannot proceed without your approval and the missing credential."
+        )
+
+    def test_response_requires_user_input_when_only_arming_without_task(self):
+        assert HermesCLI._response_requires_user_input(
+            "Armed: auto-steward max 5 hops for your next prompted task. Send the task when ready."
         )
 
     def test_response_without_question_does_not_require_user_input(self):
@@ -75,6 +86,27 @@ class TestCLIAutoSteward:
         assert "stewardship followthrough" in prompt.lower()
         assert "do not stop" in prompt.lower()
 
+    def test_message_is_auto_steward_prompt_ignores_whitespace_differences(self):
+        cli = self._make_cli(enabled=True)
+        prompt = cli._build_auto_steward_prompt().replace(" ", "\n")
+        assert cli._message_is_auto_steward_prompt(prompt)
+
+    def test_should_drop_unarmed_leaked_auto_steward_prompt(self):
+        cli = self._make_cli(enabled=True, opt_in_token="\t", armed=False)
+        assert cli._should_drop_unarmed_auto_steward_message(
+            cli._build_auto_steward_prompt()
+        )
+
+    def test_should_not_drop_armed_auto_steward_prompt(self):
+        cli = self._make_cli(enabled=True, opt_in_token="\t", armed=True)
+        assert not cli._should_drop_unarmed_auto_steward_message(
+            cli._build_auto_steward_prompt()
+        )
+
+    def test_should_not_drop_normal_message_without_token(self):
+        cli = self._make_cli(enabled=True, opt_in_token="\t", armed=False)
+        assert not cli._should_drop_unarmed_auto_steward_message("test")
+
     def test_should_not_auto_steward_when_token_required_but_missing(self):
         cli = self._make_cli(
             enabled=True, max_hops=2, depth=0, opt_in_token="\t", armed=False
@@ -98,6 +130,19 @@ class TestCLIAutoSteward:
         assert cli._message_contains_opt_in_token("hi\tthere")
         assert not cli._message_contains_opt_in_token("hi there")
 
+    def test_message_contains_visible_as_directive_suffix_and_bare_forms(self):
+        cli = self._make_cli(opt_in_token="/as")
+        assert cli._message_contains_opt_in_token("fix it /as")
+        assert cli._message_contains_opt_in_token("fix it /as5")
+        assert cli._message_contains_opt_in_token("/as")
+        assert cli._message_contains_opt_in_token("/as5")
+        assert not cli._message_contains_opt_in_token("document /as literally in prose")
+
+    def test_coerce_auto_steward_message_fills_bare_directive_gap(self):
+        cli = self._make_cli(opt_in_token="/as")
+        parsed = cli._parse_auto_steward_directive("/as")
+        assert cli._coerce_auto_steward_message(parsed).startswith("Continue from the existing context")
+
     def test_message_contains_opt_in_token_multimodal_list(self):
         cli = self._make_cli(opt_in_token="\t")
         assert cli._message_contains_opt_in_token([
@@ -117,3 +162,119 @@ class TestCLIAutoSteward:
             "Done: did the thing. Remaining: more obvious safe steps available.",
             {"failed": False, "partial": False, "interrupted": False},
         )
+
+    def test_response_looks_terminal_for_should_stop_here_because(self):
+        assert HermesCLI._response_looks_terminal(
+            "Done: the only explicit task in this conversation was completed exactly. Remaining: no substantive project/task was provided. Blocked: there is no safe next action. I should stop here because continuing would invent work."
+        )
+
+    def test_chat_consumes_pending_bare_directive_before_reparse(self):
+        cli = self._make_cli(enabled=True, max_hops=8, depth=0, opt_in_token="/as", armed=False)
+        cli._auto_steward_default_hops = 3
+        cli._auto_steward_hard_cap_hops = 8
+        cli._auto_steward_last_directive = None
+        cli._auto_steward_effective_hops = 3
+        cli._auto_steward_episode = None
+        cli._auto_steward_pending_directive = cli._parse_auto_steward_directive("/as5")
+        cli._secret_capture_callback = None
+        cli._ensure_runtime_credentials = lambda: False
+        cli.conversation_history = []
+        cli.session_id = "cli-test"
+        cli.console = MagicMock()
+
+        result = cli.chat("Continue from the existing context and execute the highest-leverage safe next steps now.")
+
+        assert "Auto-steward armed for 5 hops" in result
+        assert cli._auto_steward_pending_directive is None
+        assert cli._auto_steward_armed is True
+        assert cli._auto_steward_effective_hops == 5
+        assert cli._auto_steward_last_directive.raw_directive == "/as5"
+
+    def test_chat_handles_bare_directive_locally_without_model_roundtrip(self):
+        cli = self._make_cli(enabled=True, max_hops=8, depth=0, opt_in_token="/as", armed=False)
+        cli._auto_steward_default_hops = 3
+        cli._auto_steward_hard_cap_hops = 8
+        cli._auto_steward_last_directive = None
+        cli._auto_steward_effective_hops = 3
+        cli._auto_steward_episode = None
+        cli._auto_steward_pending_directive = cli._parse_auto_steward_directive("/as5")
+        cli._secret_capture_callback = None
+        cli._ensure_runtime_credentials = lambda: (_ for _ in ()).throw(AssertionError("model path should not run"))
+        cli.conversation_history = []
+        cli.session_id = "cli-test"
+        cli.console = MagicMock()
+
+        result = cli.chat("Continue from the existing context and execute the highest-leverage safe next steps now.")
+
+        assert isinstance(result, str)
+        assert "Auto-steward armed for 5 hops" in result
+        assert "actual request with /as5 appended" in result
+
+
+def test_main_quiet_single_query_bare_directive_uses_chat_local_path(monkeypatch, capsys):
+    created = {}
+
+    class FakeCLI:
+        def __init__(self, *args, **kwargs):
+            self.tool_progress_mode = "all"
+            self.session_id = "sess-123"
+            self.chat_calls = []
+            self.console = SimpleNamespace(print=lambda *a, **k: None)
+            created["cli"] = self
+
+        def chat(self, query):
+            self.chat_calls.append(query)
+            return "Auto-steward armed for 5 hops"
+
+        def _parse_auto_steward_directive(self, query):
+            return SimpleNamespace(armed=True, sanitized_message="")
+
+        def _ensure_runtime_credentials(self):
+            raise AssertionError("quiet single-query bare /asN should not pre-init credentials")
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_mod.main(query="/as5", quiet=True)
+
+    assert excinfo.value.code == 0
+    assert created["cli"].chat_calls == ["/as5"]
+    output = capsys.readouterr().out
+    assert "Auto-steward armed for 5 hops" in output
+    assert "session_id: sess-123" in output
+
+
+def test_main_single_query_bare_directive_prints_local_notice(monkeypatch, capsys):
+    created = {}
+    console_lines = []
+
+    class FakeCLI:
+        def __init__(self, *args, **kwargs):
+            self.session_id = "sess-456"
+            self.chat_calls = []
+            self.console = SimpleNamespace(print=lambda *a, **k: console_lines.append(" ".join(str(x) for x in a)))
+            created["cli"] = self
+
+        def show_banner(self):
+            console_lines.append("banner")
+
+        def _print_exit_summary(self):
+            console_lines.append("summary")
+
+        def chat(self, query):
+            self.chat_calls.append(query)
+            return "Auto-steward armed for 5 hops"
+
+        def _parse_auto_steward_directive(self, query):
+            return SimpleNamespace(armed=True, sanitized_message="")
+
+        def _ensure_runtime_credentials(self):
+            raise AssertionError("bare /asN should not pre-init credentials")
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+
+    cli_mod.main(query="/as5", quiet=False)
+
+    assert created["cli"].chat_calls == ["/as5"]
+    assert console_lines == []
+    assert "Auto-steward armed for 5 hops" in capsys.readouterr().out

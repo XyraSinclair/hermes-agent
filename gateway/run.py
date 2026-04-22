@@ -40,6 +40,20 @@ from agent.account_usage import fetch_account_usage, render_account_usage_lines
 _AGENT_CACHE_MAX_SIZE = 128
 _AGENT_CACHE_IDLE_TTL_SECS = 3600.0  # evict agents idle for >1h
 
+from autosteward.engine import (
+    build_followthrough_prompt,
+    create_episode_state,
+    decide_followthrough,
+)
+from autosteward.parser import parse_auto_steward_directive
+from autosteward.prompts import (
+    build_auto_steward_prompt,
+    build_bare_auto_steward_notice,
+    is_auto_steward_prompt,
+)
+from autosteward.reviewer import review_decision_async
+from autosteward.state import AutoStewardConfig, ParsedDirective
+
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
 # Must run BEFORE any HTTP library (discord, aiohttp, etc.) is imported.
@@ -754,27 +768,62 @@ class GatewayRunner:
             "1", "true", "yes", "y", "on"
         )
         try:
-            _max_hops_raw = _auto_steward_cfg.get("max_hops", os.getenv("HERMES_AUTO_STEWARD_MAX_HOPS", "1"))
-            self._auto_steward_max_hops = max(0, int(_max_hops_raw))
+            _legacy_max_hops = max(0, int(_auto_steward_cfg.get("max_hops", os.getenv("HERMES_AUTO_STEWARD_MAX_HOPS", "1"))))
         except Exception:
-            self._auto_steward_max_hops = 1
+            _legacy_max_hops = 1
         _notice_raw = _auto_steward_cfg.get("notice", os.getenv("HERMES_AUTO_STEWARD_NOTICE", "1"))
         self._auto_steward_notice = str(_notice_raw).strip().lower() not in (
             "0", "false", "no", "off"
         )
         self._auto_steward_depths: Dict[str, int] = {}
-        # Opt-in token: if non-empty, auto-steward only fires when the
-        # user's incoming message contains this literal substring. Empty
-        # string disables token gating. Default is a literal tab ("\t")
-        # so everyday messages don't accidentally trigger stewardship.
         _opt_in_token_raw = _auto_steward_cfg.get(
-            "opt_in_token", os.getenv("HERMES_AUTO_STEWARD_OPT_IN_TOKEN", "\t")
+            "opt_in_token", os.getenv("HERMES_AUTO_STEWARD_OPT_IN_TOKEN", "/as")
         )
         self._auto_steward_opt_in_token = str(_opt_in_token_raw) if _opt_in_token_raw is not None else ""
-        # Per-session armed state — set when an incoming user message
-        # contains the opt-in token; preserved across followthrough hops
-        # (which carry their own raw_message["auto_steward"]==True flag).
+        self._auto_steward_opt_in_required = bool(_auto_steward_cfg.get("opt_in_required", True))
+        self._auto_steward_default_hops = max(
+            0,
+            int(_auto_steward_cfg.get("default_hops_when_armed", _legacy_max_hops)),
+        )
+        self._auto_steward_hard_cap_hops = max(
+            0,
+            int(_auto_steward_cfg.get("hard_cap_hops", _legacy_max_hops)),
+        )
+        self._auto_steward_max_hops = self._auto_steward_hard_cap_hops or _legacy_max_hops
+        self._auto_steward_cfg = AutoStewardConfig(
+            enabled=self._auto_steward_enabled,
+            opt_in_required=self._auto_steward_opt_in_required,
+            opt_in_token=self._auto_steward_opt_in_token,
+            default_hops_when_armed=self._auto_steward_default_hops,
+            hard_cap_hops=self._auto_steward_hard_cap_hops or self._auto_steward_default_hops,
+            decision_mode=str(_auto_steward_cfg.get("decision_mode", "heuristic") or "heuristic"),
+            low_progress_patience=int(_auto_steward_cfg.get("low_progress_patience", 2)),
+            done_threshold=float(_auto_steward_cfg.get("done_threshold", 0.80)),
+            continue_threshold=float(_auto_steward_cfg.get("continue_threshold", 0.45)),
+            stop_threshold=float(_auto_steward_cfg.get("stop_threshold", 0.30)),
+            redirect_margin=float(_auto_steward_cfg.get("redirect_margin", 0.20)),
+            review_enabled=bool(_auto_steward_cfg.get("review_enabled", False)),
+            review_on_user_input_boundary=bool(_auto_steward_cfg.get("review_on_user_input_boundary", True)),
+            review_provider=str(_auto_steward_cfg.get("review_provider", "anthropic") or "anthropic"),
+            review_model=str(_auto_steward_cfg.get("review_model", "claude-opus-4.6") or "claude-opus-4.6"),
+            review_base_url=str(_auto_steward_cfg.get("review_base_url", "") or ""),
+            review_api_key=str(_auto_steward_cfg.get("review_api_key", "") or ""),
+            review_timeout=float(_auto_steward_cfg.get("review_timeout", 45)),
+            review_min_confidence=float(_auto_steward_cfg.get("review_min_confidence", 0.75)),
+            review_start_hop=int(_auto_steward_cfg.get("review_start_hop", 3)),
+            review_band=float(_auto_steward_cfg.get("review_band", 0.10)),
+            max_reviews_per_episode=int(_auto_steward_cfg.get("max_reviews_per_episode", 2)),
+            notice=self._auto_steward_notice,
+            log_episodes=bool(_auto_steward_cfg.get("log_episodes", True)),
+        )
+        # Per-session armed state and directive metadata. Fresh user messages may
+        # arm/disarm via trailing /as or /asN directives; followthrough events reuse
+        # the stored state rather than reparsing the synthetic continuation text.
         self._auto_steward_armed: Dict[str, bool] = {}
+        self._auto_steward_effective_hops: Dict[str, int] = {}
+        self._auto_steward_directives: Dict[str, ParsedDirective] = {}
+        self._auto_steward_episodes: Dict[str, Any] = {}
+        self._auto_steward_last_decisions: Dict[str, Any] = {}
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
@@ -909,6 +958,10 @@ class GatewayRunner:
             "let me know if you want",
             "please choose",
             "need clarification",
+            "send the task when ready",
+            "await a concrete task",
+            "a real task/instruction from you",
+            "wait for your actual task",
         )
         if any(needle in text for needle in hard_blockers):
             return True
@@ -941,23 +994,109 @@ class GatewayRunner:
             "nothing further i can safely",
             "no specific executable task",
             "no concrete executable task",
+            "no substantive project/task",
+            "no actual subtask",
+            "there is no safe next action",
+            "i should stop here because",
             "work is complete",
             "prior request already completed exactly as asked",
         )
         return any(marker in text for marker in terminal_markers)
 
-    def _build_auto_steward_prompt(self) -> str:
-        return (
-            "This is an automated stewardship followthrough message. Reassess the conversation from the perspective of the user's overall strategic intent, not just the last sentence. "
-            "Do you understand the overall intent? Does it overall seem safe to continue right now? You have a tendency to stop too early, so if the intent is clear and the next steps are obvious and safe, actually continue and do them now. "
-            "Before acting, briefly state done / remaining / blocked in <=5 lines. Then continue exhaustively through the highest-leverage safe next steps available from the current context. "
-            "Do not stop merely to narrate, summarize, or offer obvious next steps. Only stop when the work is genuinely complete, concretely blocked, or requires non-retrievable user input. If you stop, say why in one sentence."
-        )
+    def _build_auto_steward_prompt(self, decision=None) -> str:
+        return build_auto_steward_prompt(decision)
+
+    @staticmethod
+    def _normalize_auto_steward_text(text: Any) -> str:
+        if not isinstance(text, str):
+            return ""
+        return " ".join(text.split())
+
+    def _message_is_auto_steward_prompt(self, text: Any) -> bool:
+        return is_auto_steward_prompt(text)
+
+    def _parse_auto_steward_directive(self, text: Any) -> ParsedDirective:
+        self._ensure_auto_steward_runtime_state()
+        cfg = getattr(self, "_auto_steward_cfg", None)
+        if cfg is None:
+            token = getattr(self, "_auto_steward_opt_in_token", "") or ""
+            max_hops = getattr(
+                self,
+                "_auto_steward_hard_cap_hops",
+                getattr(self, "_auto_steward_max_hops", 8) or 8,
+            ) or 8
+            default_hops = getattr(self, "_auto_steward_default_hops", max_hops) or max_hops
+            cfg = AutoStewardConfig(
+                enabled=getattr(self, "_auto_steward_enabled", False),
+                opt_in_required=getattr(self, "_auto_steward_opt_in_required", bool(token)),
+                opt_in_token=token,
+                default_hops_when_armed=default_hops,
+                hard_cap_hops=max_hops,
+                notice=getattr(self, "_auto_steward_notice", True),
+            )
+        return parse_auto_steward_directive(text, cfg)
+
+    def _ensure_auto_steward_runtime_state(self) -> None:
+        """Backfill auto-steward config/state for tests that instantiate GatewayRunner via object.__new__."""
+        if not hasattr(self, "_auto_steward_enabled"):
+            self._auto_steward_enabled = False
+        if not hasattr(self, "_auto_steward_notice"):
+            self._auto_steward_notice = True
+        if not hasattr(self, "_auto_steward_opt_in_token"):
+            self._auto_steward_opt_in_token = "/as"
+        if not hasattr(self, "_auto_steward_opt_in_required"):
+            self._auto_steward_opt_in_required = True
+        if not hasattr(self, "_auto_steward_default_hops"):
+            self._auto_steward_default_hops = 8
+        if not hasattr(self, "_auto_steward_hard_cap_hops"):
+            self._auto_steward_hard_cap_hops = 8
+        if not hasattr(self, "_auto_steward_max_hops"):
+            self._auto_steward_max_hops = self._auto_steward_hard_cap_hops or self._auto_steward_default_hops
+        if not hasattr(self, "_auto_steward_cfg"):
+            self._auto_steward_cfg = AutoStewardConfig(
+                enabled=self._auto_steward_enabled,
+                opt_in_required=self._auto_steward_opt_in_required,
+                opt_in_token=self._auto_steward_opt_in_token,
+                default_hops_when_armed=self._auto_steward_default_hops,
+                hard_cap_hops=self._auto_steward_hard_cap_hops or self._auto_steward_default_hops,
+                notice=self._auto_steward_notice,
+            )
+        if not isinstance(getattr(self, "_auto_steward_depths", None), dict):
+            self._auto_steward_depths = {}
+        if not isinstance(getattr(self, "_auto_steward_armed", None), dict):
+            self._auto_steward_armed = {}
+        if not isinstance(getattr(self, "_auto_steward_effective_hops", None), dict):
+            self._auto_steward_effective_hops = {}
+        if not isinstance(getattr(self, "_auto_steward_directives", None), dict):
+            self._auto_steward_directives = {}
+        if not isinstance(getattr(self, "_auto_steward_episodes", None), dict):
+            self._auto_steward_episodes = {}
+        if not isinstance(getattr(self, "_auto_steward_last_decisions", None), dict):
+            self._auto_steward_last_decisions = {}
+
+    @staticmethod
+    def _coerce_auto_steward_message(parsed: ParsedDirective) -> str:
+        text = (parsed.sanitized_message or "").strip()
+        if text:
+            return text
+        if parsed.armed:
+            return "Continue from the existing context and execute the highest-leverage safe next steps now."
+        return parsed.sanitized_message
+
+    def _should_drop_unarmed_auto_steward_message(self, text: Any, *, session_key: str = "") -> bool:
+        token = getattr(self, "_auto_steward_opt_in_token", "") or ""
+        if not token:
+            return False
+        if not self._message_is_auto_steward_prompt(text):
+            return False
+        return not self._auto_steward_armed.get(session_key, False)
 
     def _message_contains_opt_in_token(self, text: Any) -> bool:
         token = getattr(self, "_auto_steward_opt_in_token", "") or ""
         if not token:
             return True
+        if isinstance(text, str) and token.strip().startswith("/"):
+            return self._parse_auto_steward_directive(text).armed
         if isinstance(text, str):
             return token in text
         if isinstance(text, list):
@@ -970,25 +1109,54 @@ class GatewayRunner:
                         return True
         return False
 
-    def _should_auto_steward(self, response: str, result: Optional[Dict[str, Any]] = None, *, session_key: str = "") -> bool:
+    def _decide_auto_steward(self, response: str, result: Optional[Dict[str, Any]] = None, *, session_key: str = ""):
+        self._ensure_auto_steward_runtime_state()
         if not self._auto_steward_enabled:
-            return False
-        if self._auto_steward_depths.get(session_key, 0) >= self._auto_steward_max_hops:
-            return False
+            return None
         if not response or not str(response).strip():
-            return False
+            return None
         if result and (result.get("failed") or result.get("partial") or result.get("interrupted")):
-            return False
-        if self._response_requires_user_input(response):
-            return False
-        if self._response_looks_terminal(response):
-            return False
-        # Token gating: when an opt-in token is configured, the originating
-        # user message in this session must have armed the chain.
+            return None
         token = getattr(self, "_auto_steward_opt_in_token", "") or ""
         if token and not self._auto_steward_armed.get(session_key, False):
-            return False
-        return True
+            return None
+        effective_max = max(
+            0,
+            int(self._auto_steward_effective_hops.get(session_key, self._auto_steward_max_hops) or 0),
+        )
+        if self._auto_steward_depths.get(session_key, 0) >= effective_max:
+            return None
+        episode = self._auto_steward_episodes.get(session_key)
+        armed = self._auto_steward_armed.get(session_key, False) or not token
+        if episode is None:
+            directive = self._auto_steward_directives.get(session_key) or ParsedDirective(
+                armed=armed,
+                raw_directive=None,
+                requested_hops=None,
+                effective_hops=effective_max,
+                sanitized_message="",
+                warnings=[],
+            )
+            episode = create_episode_state(session_id=session_key, directive=directive, previous=None)
+            episode.armed = armed
+            episode.effective_max_hops = effective_max
+            self._auto_steward_episodes[session_key] = episode
+        episode.armed = armed
+        episode.effective_max_hops = effective_max
+        decision, _hop = decide_followthrough(
+            episode=episode,
+            response=response,
+            result=result,
+            cfg=getattr(self, "_auto_steward_cfg", AutoStewardConfig(enabled=False)),
+            response_requires_user_input=self._response_requires_user_input,
+            response_looks_terminal=self._response_looks_terminal,
+        )
+        self._auto_steward_last_decisions[session_key] = decision
+        return decision
+
+    def _should_auto_steward(self, response: str, result: Optional[Dict[str, Any]] = None, *, session_key: str = "") -> bool:
+        decision = self._decide_auto_steward(response, result, session_key=session_key)
+        return bool(decision and decision.kind.value in ("continue", "redirect", "review"))
 
     def _set_adapter_auto_tts_disabled(self, adapter, chat_id: str, disabled: bool) -> None:
         """Update an adapter's in-memory auto-TTS suppression set if present."""
@@ -3880,30 +4048,39 @@ class GatewayRunner:
                 else:
                     # Not an active skill — check if it's a known-but-disabled or
                     # uninstalled skill and give actionable guidance.
-                    _unavail_msg = _check_unavailable_skill(command)
-                    if _unavail_msg:
-                        return _unavail_msg
-                    # Genuinely unrecognized /command: not a built-in, not a
-                    # plugin, not a skill, not a known-inactive skill. Warn
-                    # the user instead of silently forwarding it to the LLM
-                    # as free text (which leads to silent-failure behavior
-                    # like the model inventing a delegate_task call).
-                    # Normalize to hyphenated form before checking known
-                    # built-ins (command may be an alias target set by the
-                    # quick-command block above, so _cmd_def can be stale).
-                    if command.replace("_", "-") not in GATEWAY_KNOWN_COMMANDS:
-                        logger.warning(
-                            "Unrecognized slash command /%s from %s — "
-                            "replying with unknown-command notice",
-                            command,
-                            source.platform.value if source.platform else "?",
-                        )
-                        return (
-                            f"Unknown command `/{command}`. "
-                            f"Type /commands to see what's available, "
-                            f"or resend without the leading slash to send "
-                            f"as a regular message."
-                        )
+                    _directive = self._parse_auto_steward_directive(getattr(event, "text", "") or "")
+                    if _directive.armed:
+                        _raw = getattr(event, "raw_message", None)
+                        if not isinstance(_raw, dict):
+                            _raw = {}
+                            event.raw_message = _raw
+                        _raw["auto_steward_directive"] = _directive.to_payload()
+                        event.text = self._coerce_auto_steward_message(_directive)
+                    else:
+                        _unavail_msg = _check_unavailable_skill(command)
+                        if _unavail_msg:
+                            return _unavail_msg
+                        # Genuinely unrecognized /command: not a built-in, not a
+                        # plugin, not a skill, not a known-inactive skill. Warn
+                        # the user instead of silently forwarding it to the LLM
+                        # as free text (which leads to silent-failure behavior
+                        # like the model inventing a delegate_task call).
+                        # Normalize to hyphenated form before checking known
+                        # built-ins (command may be an alias target set by the
+                        # quick-command block above, so _cmd_def can be stale).
+                        if command.replace("_", "-") not in GATEWAY_KNOWN_COMMANDS:
+                            logger.warning(
+                                "Unrecognized slash command /%s from %s — "
+                                "replying with unknown-command notice",
+                                command,
+                                source.platform.value if source.platform else "?",
+                            )
+                            return (
+                                f"Unknown command `/{command}`. "
+                                f"Type /commands to see what's available, "
+                                f"or resend without the leading slash to send "
+                                f"as a regular message."
+                            )
             except Exception as e:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
         
@@ -4106,20 +4283,51 @@ class GatewayRunner:
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
 
-        # Arm / disarm auto-steward token-gating for this session based on
-        # the incoming user message. Followthrough events carry
-        # raw_message["auto_steward"] == True and must NOT touch the
-        # arming state — they inherit the original chain's arming.
+        self._ensure_auto_steward_runtime_state()
+
+        # Consume the original directive exactly once per user-authored event.
+        # Followthrough events advertise raw_message["auto_steward"] == True and
+        # must keep the stored armed state rather than reparsing synthetic text.
         _raw_msg = getattr(event, "raw_message", None) or {}
+        if not isinstance(_raw_msg, dict):
+            _raw_msg = {}
+            event.raw_message = _raw_msg
         _is_followthrough_event = bool(
             isinstance(_raw_msg, dict) and _raw_msg.get("auto_steward")
         )
+        _pending_directive_payload = _raw_msg.get("auto_steward_directive") if isinstance(_raw_msg, dict) else None
         if not _is_followthrough_event:
-            armed = self._message_contains_opt_in_token(getattr(event, "text", "") or "")
-            if armed:
+            if isinstance(_pending_directive_payload, dict):
+                parsed_directive = ParsedDirective.from_payload(_pending_directive_payload)
+                _raw_msg.pop("auto_steward_directive", None)
+            else:
+                parsed_directive = self._parse_auto_steward_directive(getattr(event, "text", "") or "")
+            self._auto_steward_directives[session_key] = parsed_directive
+            if parsed_directive.armed:
                 self._auto_steward_armed[session_key] = True
+                self._auto_steward_effective_hops[session_key] = parsed_directive.effective_hops or self._auto_steward_default_hops
             else:
                 self._auto_steward_armed.pop(session_key, None)
+                self._auto_steward_effective_hops.pop(session_key, None)
+            self._auto_steward_episodes[session_key] = create_episode_state(
+                session_id=session_key,
+                directive=parsed_directive,
+                previous=self._auto_steward_episodes.get(session_key),
+            )
+            if parsed_directive.warnings:
+                for warning in parsed_directive.warnings:
+                    logger.info("Gateway auto-steward directive warning for %s: %s", session_key, warning)
+            if parsed_directive.armed and not (parsed_directive.sanitized_message or "").strip():
+                return build_bare_auto_steward_notice(parsed_directive)
+            if isinstance(getattr(event, "text", None), str):
+                event.text = self._coerce_auto_steward_message(parsed_directive)
+
+        if self._should_drop_unarmed_auto_steward_message(getattr(event, "text", "") or "", session_key=session_key):
+            logger.warning(
+                "Dropping leaked unarmed auto-steward prompt for session %s",
+                session_key,
+            )
+            return None
 
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
@@ -4871,14 +5079,27 @@ class GatewayRunner:
             # post-processing in _process_message_background is skipped
             # when already_sent is True, so media files would never be
             # delivered without this.
-            if self._should_auto_steward(response, agent_result, session_key=session_key):
+            decision = self._decide_auto_steward(response, agent_result, session_key=session_key)
+            if decision is not None:
+                review_outcome = await review_decision_async(
+                    episode=self._auto_steward_episodes.get(session_key),
+                    response=response,
+                    decision=decision,
+                    cfg=getattr(self, "_auto_steward_cfg", AutoStewardConfig(enabled=False)),
+                )
+                if review_outcome.approved:
+                    decision = review_outcome.replacement
+            if decision and decision.kind.value in ("continue", "redirect", "review"):
                 adapter = self.adapters.get(source.platform)
                 if self._auto_steward_notice:
                     logger.info(
-                        "auto-steward continuing session %s (depth=%d/%d)",
+                        "auto-steward %s session %s (source=%s depth=%d/%d reasons=%s)",
+                        decision.kind.value,
                         session_key,
+                        (decision.metadata or {}).get("decision_source", "HEURISTIC_ONLY"),
                         self._auto_steward_depths.get(session_key, 0) + 1,
-                        self._auto_steward_max_hops,
+                        self._auto_steward_effective_hops.get(session_key, self._auto_steward_max_hops),
+                        ",".join(decision.reason_codes),
                     )
                 if response and not agent_result.get("already_sent") and adapter:
                     try:
@@ -4892,7 +5113,7 @@ class GatewayRunner:
 
                 from gateway.platforms.base import MessageEvent, MessageType
                 follow_event = MessageEvent(
-                    text=self._build_auto_steward_prompt(),
+                    text=build_followthrough_prompt(decision),
                     message_type=MessageType.TEXT,
                     source=source,
                     raw_message={"auto_steward": True},

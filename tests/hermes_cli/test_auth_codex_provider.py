@@ -4,6 +4,7 @@ import json
 import time
 import base64
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import yaml
@@ -88,6 +89,7 @@ def test_resolve_codex_runtime_credentials_refreshes_expiring_token(tmp_path, mo
     expiring_token = _jwt_with_exp(int(time.time()) - 10)
     _setup_hermes_auth(hermes_home, access_token=expiring_token, refresh_token="refresh-old")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth._get_codex_pool_entry", lambda: (None, None))
 
     called = {"count": 0}
 
@@ -107,6 +109,7 @@ def test_resolve_codex_runtime_credentials_force_refresh(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _setup_hermes_auth(hermes_home, access_token="access-current", refresh_token="refresh-old")
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth._get_codex_pool_entry", lambda: (None, None))
 
     called = {"count": 0}
 
@@ -185,8 +188,70 @@ def test_resolve_returns_hermes_auth_store_source(tmp_path, monkeypatch):
     hermes_home = tmp_path / "hermes"
     _setup_hermes_auth(hermes_home)
     monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    monkeypatch.setattr("hermes_cli.auth._get_codex_pool_entry", lambda: (None, None))
 
     creds = resolve_codex_runtime_credentials()
     assert creds["source"] == "hermes-auth-store"
     assert creds["provider"] == "openai-codex"
     assert creds["base_url"] == DEFAULT_CODEX_BASE_URL
+
+
+def test_resolve_codex_runtime_credentials_prefers_pool_and_syncs_store(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="store-at", refresh_token="store-rt")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    fake_pool = SimpleNamespace(try_refresh_current=lambda: None)
+    fake_entry = SimpleNamespace(
+        access_token="pool-at",
+        refresh_token="pool-rt",
+        label="device_code",
+        id="pool01",
+        last_refresh="2026-04-12T22:50:00Z",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._get_codex_pool_entry",
+        lambda: (fake_pool, fake_entry),
+    )
+
+    creds = resolve_codex_runtime_credentials()
+    stored = _read_codex_tokens()
+
+    assert creds["api_key"] == "pool-at"
+    assert creds["source"] == "credential-pool:device_code"
+    assert stored["tokens"]["access_token"] == "pool-at"
+    assert stored["tokens"]["refresh_token"] == "pool-rt"
+
+
+def test_resolve_codex_runtime_credentials_force_refreshes_pool_when_synced(tmp_path, monkeypatch):
+    hermes_home = tmp_path / "hermes"
+    _setup_hermes_auth(hermes_home, access_token="pool-at", refresh_token="pool-rt")
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+
+    refreshed_entry = SimpleNamespace(
+        access_token="pool-at-new",
+        refresh_token="pool-rt-new",
+        label="device_code",
+        id="pool01",
+        last_refresh="2026-04-12T22:55:00Z",
+    )
+    fake_pool = SimpleNamespace(try_refresh_current=lambda: refreshed_entry)
+    fake_entry = SimpleNamespace(
+        access_token="pool-at",
+        refresh_token="pool-rt",
+        label="device_code",
+        id="pool01",
+        last_refresh="2026-04-12T22:50:00Z",
+    )
+    monkeypatch.setattr(
+        "hermes_cli.auth._get_codex_pool_entry",
+        lambda: (fake_pool, fake_entry),
+    )
+
+    creds = resolve_codex_runtime_credentials(force_refresh=True, refresh_if_expiring=False)
+    stored = _read_codex_tokens()
+
+    assert creds["api_key"] == "pool-at-new"
+    assert creds["source"] == "credential-pool:device_code"
+    assert stored["tokens"]["access_token"] == "pool-at-new"
+    assert stored["tokens"]["refresh_token"] == "pool-rt-new"
