@@ -27,7 +27,7 @@ import time
 from contextvars import copy_context
 from pathlib import Path
 from datetime import datetime
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any, List, Sequence
 
 # ---------------------------------------------------------------------------
 # SSL certificate auto-detection for NixOS and other non-standard systems.
@@ -79,6 +79,15 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from hermes_constants import get_hermes_home
 from utils import atomic_yaml_write, is_truthy_value
 _hermes_home = get_hermes_home()
+
+from agent.xyra_summary import (
+    DEFAULT_BARE_SUMMARY_REQUEST,
+    SummaryDirective,
+    format_summary_block,
+    gateway_summary_help_lines,
+    parse_summary_directive,
+    summarize_for_xyra_async,
+)
 
 # Load environment variables from ~/.hermes/.env first.
 # User-managed env files should override stale shell exports on restart.
@@ -673,6 +682,56 @@ class GatewayRunner:
         # Per-chat voice reply mode: "off" | "voice_only" | "all"
         self._voice_mode: Dict[str, str] = self._load_voice_modes()
 
+        # Auto-steward followthrough for gateway chats.
+        try:
+            import yaml as _as_yaml
+            with open(_config_path, encoding="utf-8") as _as_f:
+                _as_cfg = _as_yaml.safe_load(_as_f) or {}
+        except Exception:
+            _as_cfg = {}
+        _auto_steward_cfg = (_as_cfg.get("agent") or {}).get("auto_steward", {}) or {}
+        _auto_steward_enabled = _auto_steward_cfg.get("enabled", os.getenv("HERMES_AUTO_STEWARD", ""))
+        self._auto_steward_enabled = str(_auto_steward_enabled).strip().lower() in (
+            "1", "true", "yes", "y", "on"
+        )
+        try:
+            _max_hops_raw = _auto_steward_cfg.get("max_hops", os.getenv("HERMES_AUTO_STEWARD_MAX_HOPS", "1"))
+            self._auto_steward_max_hops = max(0, int(_max_hops_raw))
+        except Exception:
+            self._auto_steward_max_hops = 1
+        _notice_raw = _auto_steward_cfg.get("notice", os.getenv("HERMES_AUTO_STEWARD_NOTICE", "1"))
+        self._auto_steward_notice = str(_notice_raw).strip().lower() not in (
+            "0", "false", "no", "off"
+        )
+        self._auto_steward_depths: Dict[str, int] = {}
+        _opt_in_token_raw = _auto_steward_cfg.get(
+            "opt_in_token", os.getenv("HERMES_AUTO_STEWARD_OPT_IN_TOKEN", "\t")
+        )
+        _opt_in_required_raw = _auto_steward_cfg.get(
+            "opt_in_required", os.getenv("HERMES_AUTO_STEWARD_OPT_IN_REQUIRED", "1")
+        )
+        _opt_in_required = str(_opt_in_required_raw).strip().lower() not in (
+            "0", "false", "no", "off"
+        )
+        self._auto_steward_opt_in_token = (
+            str(_opt_in_token_raw) if _opt_in_required and _opt_in_token_raw is not None else ""
+        )
+        self._auto_steward_armed: Dict[str, bool] = {}
+
+        _xyra_summary_cfg = (_as_cfg.get("agent") or {}).get("xyra_summary", {}) or {}
+        _xyra_summary_enabled = _xyra_summary_cfg.get("enabled", False)
+        self._xyra_summary_enabled = str(_xyra_summary_enabled).strip().lower() in (
+            "1", "true", "yes", "y", "on"
+        )
+        _xyra_summary_token = _xyra_summary_cfg.get("opt_in_token", "/sum4xyra")
+        self._xyra_summary_opt_in_token = str(_xyra_summary_token) if _xyra_summary_token is not None else ""
+        self._xyra_summary_opt_in_required = bool(_xyra_summary_cfg.get("opt_in_required", True))
+        self._xyra_summary_two_pass = bool(_xyra_summary_cfg.get("two_pass", True))
+        self._xyra_summary_max_context_messages = max(1, int(_xyra_summary_cfg.get("max_context_messages", 8) or 8))
+        self._xyra_summary_max_chars_per_message = max(200, int(_xyra_summary_cfg.get("max_chars_per_message", 1200) or 1200))
+        self._xyra_summary_heading = str(_xyra_summary_cfg.get("heading", "Xyra summary") or "Xyra summary")
+        self._xyra_summary_armed: Dict[str, bool] = {}
+        self._xyra_summary_directives: Dict[str, SummaryDirective] = {}
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
 
@@ -717,6 +776,215 @@ class GatewayRunner:
             )
         except OSError as e:
             logger.warning("Failed to save voice modes: %s", e)
+
+    @staticmethod
+    def _response_requires_user_input(response: str) -> bool:
+        text = (response or "").strip().lower()
+        if not text:
+            return True
+        hard_blockers = (
+            "cannot proceed without",
+            "can't proceed without",
+            "need your approval",
+            "need your confirmation",
+            "requires your approval",
+            "requires your confirmation",
+            "please provide",
+            "i need your",
+            "need you to",
+            "waiting for your",
+            "what would you like",
+            "which option",
+            "which would you like",
+            "which do you want",
+            "do you want me to",
+            "want me to",
+            "would you like me to",
+            "let me know if you'd like",
+            "let me know if you want",
+            "please choose",
+            "need clarification",
+        )
+        if any(needle in text for needle in hard_blockers):
+            return True
+        question_mark = "?" in text
+        soft_questions = (
+            "should i",
+            "can you provide",
+            "do you want",
+            "would you like",
+            "what should i",
+            "which one",
+        )
+        return question_mark and any(needle in text for needle in soft_questions)
+
+    @staticmethod
+    def _response_looks_terminal(response: str) -> bool:
+        text = (response or "").strip().lower()
+        if not text:
+            return False
+        terminal_markers = (
+            "stopping because",
+            "stopping: ",
+            "stopping —",
+            "stopping -",
+            "remaining: none",
+            "remaining: no concrete task",
+            "remaining: none specified",
+            "blocked: waiting on a real objective",
+            "no further concrete task",
+            "nothing further i can safely",
+            "no specific executable task",
+            "no concrete executable task",
+            "work is complete",
+            "prior request already completed exactly as asked",
+        )
+        return any(marker in text for marker in terminal_markers)
+
+    def _build_auto_steward_prompt(self) -> str:
+        return (
+            "This is an automated stewardship followthrough message. Reassess the conversation from the perspective of the user's overall strategic intent, not just the last sentence. "
+            "Do you understand the overall intent? Does it overall seem safe to continue right now? You have a tendency to stop too early, so if the intent is clear and the next steps are obvious and safe, actually continue and do them now. "
+            "Before acting, briefly state done / remaining / blocked in <=5 lines. Then continue exhaustively through the highest-leverage safe next steps available from the current context. "
+            "Do not stop merely to narrate, summarize, or offer obvious next steps. Only stop when the work is genuinely complete, concretely blocked, or requires non-retrievable user input. If you stop, say why in one sentence."
+        )
+
+    @staticmethod
+    def _normalize_auto_steward_text(text: Any) -> str:
+        if not isinstance(text, str):
+            return ""
+        return " ".join(text.split())
+
+    def _message_is_auto_steward_prompt(self, text: Any) -> bool:
+        return (
+            self._normalize_auto_steward_text(text)
+            == self._normalize_auto_steward_text(self._build_auto_steward_prompt())
+        )
+
+    def _message_contains_opt_in_token(self, text: Any) -> bool:
+        token = getattr(self, "_auto_steward_opt_in_token", "") or ""
+        if not token:
+            return True
+        if isinstance(text, str):
+            return token in text
+        if isinstance(text, list):
+            for part in text:
+                if isinstance(part, str) and token in part:
+                    return True
+                if isinstance(part, dict):
+                    inner = part.get("text")
+                    if isinstance(inner, str) and token in inner:
+                        return True
+        return False
+
+    def _should_drop_unarmed_auto_steward_message(self, text: Any, *, session_key: str = "") -> bool:
+        token = getattr(self, "_auto_steward_opt_in_token", "") or ""
+        if not token:
+            return False
+        if not self._message_is_auto_steward_prompt(text):
+            return False
+        return not self._auto_steward_armed.get(session_key, False)
+
+    def _should_auto_steward(self, response: str, result: Optional[Dict[str, Any]] = None, *, session_key: str = "") -> bool:
+        if not self._auto_steward_enabled:
+            return False
+        if self._auto_steward_depths.get(session_key, 0) >= self._auto_steward_max_hops:
+            return False
+        if not response or not str(response).strip():
+            return False
+        if result and (result.get("failed") or result.get("partial") or result.get("interrupted")):
+            return False
+        if self._response_requires_user_input(response):
+            return False
+        if self._response_looks_terminal(response):
+            return False
+        token = getattr(self, "_auto_steward_opt_in_token", "") or ""
+        if token and not self._auto_steward_armed.get(session_key, False):
+            return False
+        return True
+
+    def _ensure_xyra_summary_runtime_state(self) -> None:
+        if not hasattr(self, "_xyra_summary_enabled"):
+            self._xyra_summary_enabled = False
+        if not hasattr(self, "_xyra_summary_opt_in_token"):
+            self._xyra_summary_opt_in_token = "/sum4xyra"
+        if not hasattr(self, "_xyra_summary_two_pass"):
+            self._xyra_summary_two_pass = True
+        if not hasattr(self, "_xyra_summary_opt_in_required"):
+            self._xyra_summary_opt_in_required = True
+        if not hasattr(self, "_xyra_summary_max_context_messages"):
+            self._xyra_summary_max_context_messages = 8
+        if not hasattr(self, "_xyra_summary_max_chars_per_message"):
+            self._xyra_summary_max_chars_per_message = 1200
+        if not hasattr(self, "_xyra_summary_heading"):
+            self._xyra_summary_heading = "Xyra summary"
+        if not isinstance(getattr(self, "_xyra_summary_armed", None), dict):
+            self._xyra_summary_armed = {}
+        if not isinstance(getattr(self, "_xyra_summary_directives", None), dict):
+            self._xyra_summary_directives = {}
+
+    def _parse_xyra_summary_directive(self, text: Any) -> SummaryDirective:
+        self._ensure_xyra_summary_runtime_state()
+        token = getattr(self, "_xyra_summary_opt_in_token", "/sum4xyra") or "/sum4xyra"
+        return parse_summary_directive(
+            text,
+            token=token,
+            opt_in_required=getattr(self, "_xyra_summary_opt_in_required", True),
+        )
+
+    def _should_generate_xyra_summary(self, decision: Any = None, *, session_key: str = "") -> bool:
+        self._ensure_xyra_summary_runtime_state()
+        if not self._xyra_summary_enabled:
+            return False
+        if not self._xyra_summary_armed.get(session_key, False):
+            return False
+        if decision and getattr(getattr(decision, "kind", None), "value", "") in {"continue", "redirect", "review"}:
+            return False
+        return True
+
+    async def _build_xyra_summary_block(self, user_message: Any, response: str, history: Sequence[dict[str, Any]] | None, decision: Any = None, result: Optional[Dict[str, Any]] = None, *, session_key: str = "") -> str:
+        if not self._should_generate_xyra_summary(decision, session_key=session_key):
+            return ""
+        if not response or not str(response).strip():
+            return ""
+        if result and (result.get("failed") or result.get("partial") or result.get("interrupted")):
+            return ""
+        try:
+            summary = await summarize_for_xyra_async(
+                user_message=user_message,
+                assistant_response=response,
+                conversation_history=history or [],
+                max_context_messages=getattr(self, "_xyra_summary_max_context_messages", 8),
+                max_chars_per_message=getattr(self, "_xyra_summary_max_chars_per_message", 1200),
+                two_pass=getattr(self, "_xyra_summary_two_pass", True),
+            )
+        except Exception as e:
+            logger.debug("Gateway Xyra summary generation failed: %s", e)
+            return ""
+        return format_summary_block(summary, heading=getattr(self, "_xyra_summary_heading", "Xyra summary"))
+
+    async def _build_direct_xyra_summary(self, history: Sequence[dict[str, Any]] | None, user_message: Any = None) -> str:
+        transcript = list(history or [])
+        assistant_messages = [m for m in transcript if isinstance(m, dict) and m.get("role") == "assistant"]
+        if not assistant_messages:
+            return "There is no prior assistant output in this chat to summarize yet."
+        assistant_response = str(assistant_messages[-1].get("content") or "").strip()
+        if not assistant_response:
+            return "There is no prior assistant output in this chat to summarize yet."
+        request = user_message or DEFAULT_BARE_SUMMARY_REQUEST
+        try:
+            summary = await summarize_for_xyra_async(
+                user_message=request,
+                assistant_response=assistant_response,
+                conversation_history=transcript,
+                max_context_messages=getattr(self, "_xyra_summary_max_context_messages", 8),
+                max_chars_per_message=getattr(self, "_xyra_summary_max_chars_per_message", 1200),
+                two_pass=getattr(self, "_xyra_summary_two_pass", True),
+            )
+        except Exception as e:
+            logger.debug("Gateway direct Xyra summary generation failed: %s", e)
+            return "Xyra summary generation failed."
+        return summary.strip() or "Xyra summary generation returned no content."
 
     def _set_adapter_auto_tts_disabled(self, adapter, chat_id: str, disabled: bool) -> None:
         """Update an adapter's in-memory auto-TTS suppression set if present."""
@@ -3001,6 +3269,9 @@ class GatewayRunner:
 
         # Check for commands
         command = event.get_command()
+        _summary_directive_preview = self._parse_xyra_summary_directive(getattr(event, "text", "") or "") if command else None
+        if command and _summary_directive_preview and _summary_directive_preview.armed:
+            command = None
         
         # Emit command:* hook for any recognized slash command.
         # GATEWAY_KNOWN_COMMANDS is derived from the central COMMAND_REGISTRY
@@ -3458,7 +3729,39 @@ class GatewayRunner:
         # Get or create session
         session_entry = self.session_store.get_or_create_session(source)
         session_key = session_entry.session_key
-        
+
+        _raw_msg = getattr(event, "raw_message", None) or {}
+        _is_followthrough_event = bool(
+            isinstance(_raw_msg, dict) and _raw_msg.get("auto_steward")
+        )
+        if not _is_followthrough_event:
+            armed = self._message_contains_opt_in_token(getattr(event, "text", "") or "")
+            if armed:
+                self._auto_steward_armed[session_key] = True
+            else:
+                self._auto_steward_armed.pop(session_key, None)
+            summary_directive = self._parse_xyra_summary_directive(getattr(event, "text", "") or "")
+            self._xyra_summary_directives[session_key] = summary_directive
+            if summary_directive.armed:
+                self._xyra_summary_armed[session_key] = True
+            else:
+                self._xyra_summary_armed.pop(session_key, None)
+            if summary_directive.armed and not (summary_directive.sanitized_message or "").strip() and summary_directive.raw_directive:
+                history = self.session_store.load_transcript(session_entry.session_id) or []
+                return await self._build_direct_xyra_summary(history, DEFAULT_BARE_SUMMARY_REQUEST)
+            if summary_directive.armed and isinstance(getattr(event, "text", None), str):
+                event.text = summary_directive.sanitized_message or getattr(event, "text", None)
+
+        if self._should_drop_unarmed_auto_steward_message(getattr(event, "text", "") or "", session_key=session_key):
+            logger.warning(
+                "Dropping leaked unarmed auto-steward prompt for session %s",
+                session_key,
+            )
+            return None
+
+        if self._draining:
+            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+
         # Emit session:start for new or auto-reset sessions
         _is_new_session = (
             session_entry.created_at == session_entry.updated_at
@@ -4162,6 +4465,23 @@ class GatewayRunner:
 
             # Auto voice reply: send TTS audio before the text response
             _already_sent = bool(agent_result.get("already_sent"))
+            summary_block = await self._build_xyra_summary_block(
+                getattr(event, "text", "") or "",
+                response,
+                history,
+                None,
+                agent_result,
+                session_key=session_key,
+            )
+            if summary_block and not _already_sent:
+                response = f"{response}{summary_block}" if response else summary_block.lstrip()
+            elif summary_block and _already_sent:
+                adapter = self.adapters.get(source.platform)
+                if adapter:
+                    try:
+                        await adapter.send(source.chat_id, summary_block.strip(), metadata=getattr(event, "metadata", None))
+                    except Exception as e:
+                        logger.warning("Failed to send Xyra summary block: %s", e)
             if self._should_send_voice_reply(event, response, agent_messages, already_sent=_already_sent):
                 await self._send_voice_reply(event, response)
 
@@ -4563,6 +4883,17 @@ class GatewayRunner:
             *gateway_help_lines(),
         ]
         try:
+            xyra_lines = gateway_summary_help_lines(
+                token=getattr(self, "_xyra_summary_opt_in_token", "/sum4xyra"),
+                enabled=getattr(self, "_xyra_summary_enabled", False),
+                opt_in_required=getattr(self, "_xyra_summary_opt_in_required", True),
+            )
+            if xyra_lines:
+                lines.append("\n🧭 **Xyra Summary**:")
+                lines.extend(xyra_lines)
+        except Exception:
+            pass
+        try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()
             if skill_cmds:
@@ -4590,8 +4921,18 @@ class GatewayRunner:
         else:
             requested_page = 1
 
-        # Build combined entry list: built-in commands + skill commands
-        entries = list(gateway_help_lines())
+        # Build combined entry list: Xyra summary + built-in commands + skill commands
+        entries: list[str] = []
+        xyra_lines = gateway_summary_help_lines(
+            token=getattr(self, "_xyra_summary_opt_in_token", "/sum4xyra"),
+            enabled=getattr(self, "_xyra_summary_enabled", False),
+            opt_in_required=getattr(self, "_xyra_summary_opt_in_required", True),
+        )
+        if xyra_lines:
+            entries.append("🧭 **Xyra Summary**:")
+            entries.extend(xyra_lines)
+            entries.append("")
+        entries.extend(gateway_help_lines())
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()
