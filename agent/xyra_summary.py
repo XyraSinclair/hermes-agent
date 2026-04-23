@@ -19,6 +19,64 @@ class SummaryDirective:
 DEFAULT_BARE_SUMMARY_REQUEST = "Summarize the last assistant output and current state for Xyra."
 
 
+def summary_help_entries(
+    *,
+    token: str = "/sum4xyra",
+    enabled: bool = False,
+    opt_in_required: bool = True,
+) -> list[tuple[str, str]]:
+    token = str(token or "/sum4xyra").strip() or "/sum4xyra"
+    if not enabled:
+        return []
+
+    entries: list[tuple[str, str]] = [
+        (
+            token,
+            "Summarize the most relevant recent state / last assistant output for Xyra.",
+        )
+    ]
+    if opt_in_required:
+        entries.append(
+            (
+                f"<message> {token}",
+                "Answer normally, then append a Xyra-tuned summary of the final response.",
+            )
+        )
+    else:
+        entries.append(
+            (
+                "default final responses",
+                "Append a Xyra-tuned summary automatically on successful final replies.",
+            )
+        )
+        entries.append(
+            (
+                f"<message> {token}",
+                "Force the opt-in token explicitly even though default summaries are already enabled.",
+            )
+        )
+    return entries
+
+
+def gateway_summary_help_lines(
+    *,
+    token: str = "/sum4xyra",
+    enabled: bool = False,
+    opt_in_required: bool = True,
+) -> list[str]:
+    lines: list[str] = []
+    for label, description in summary_help_entries(
+        token=token,
+        enabled=enabled,
+        opt_in_required=opt_in_required,
+    ):
+        if label == "default final responses":
+            lines.append(f"`{label}` — {description}")
+        else:
+            lines.append(f"`{label}` — {description}")
+    return lines
+
+
 def parse_summary_directive(
     message: Any,
     token: str = "/sum4xyra",

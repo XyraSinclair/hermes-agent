@@ -59,6 +59,7 @@ from agent.xyra_summary import (
     format_summary_block,
     parse_summary_directive,
     summarize_for_xyra_async,
+    gateway_summary_help_lines,
 )
 
 # ---------------------------------------------------------------------------
@@ -5848,6 +5849,17 @@ class GatewayRunner:
             *gateway_help_lines(),
         ]
         try:
+            xyra_lines = gateway_summary_help_lines(
+                token=getattr(self, "_xyra_summary_opt_in_token", "/sum4xyra"),
+                enabled=getattr(self, "_xyra_summary_enabled", False),
+                opt_in_required=getattr(self, "_xyra_summary_opt_in_required", True),
+            )
+            if xyra_lines:
+                lines.append("\n🧭 **Xyra Summary**:")
+                lines.extend(xyra_lines)
+        except Exception:
+            pass
+        try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()
             if skill_cmds:
@@ -5875,8 +5887,18 @@ class GatewayRunner:
         else:
             requested_page = 1
 
-        # Build combined entry list: built-in commands + skill commands
-        entries = list(gateway_help_lines())
+        # Build combined entry list: Xyra summary + built-in commands + skill commands
+        entries: list[str] = []
+        xyra_lines = gateway_summary_help_lines(
+            token=getattr(self, "_xyra_summary_opt_in_token", "/sum4xyra"),
+            enabled=getattr(self, "_xyra_summary_enabled", False),
+            opt_in_required=getattr(self, "_xyra_summary_opt_in_required", True),
+        )
+        if xyra_lines:
+            entries.append("🧭 **Xyra Summary**:")
+            entries.extend(xyra_lines)
+            entries.append("")
+        entries.extend(gateway_help_lines())
         try:
             from agent.skill_commands import get_skill_commands
             skill_cmds = get_skill_commands()

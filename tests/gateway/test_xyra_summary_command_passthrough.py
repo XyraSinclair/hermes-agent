@@ -86,3 +86,30 @@ async def test_gateway_bare_sum4xyra_is_not_treated_as_unknown_command(monkeypat
     assert result == "Bottom line\n- summary"
     runner._build_direct_xyra_summary.assert_awaited()
     runner._run_agent.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_gateway_help_mentions_xyra_summary_when_enabled():
+    runner = _make_runner()
+    runner._xyra_summary_enabled = True
+    runner._xyra_summary_opt_in_required = False
+    runner._xyra_summary_opt_in_token = "/sum4xyra"
+
+    result = await runner._handle_help_command(_make_event("/help"))
+
+    assert "Xyra Summary" in result
+    assert "`/sum4xyra`" in result
+    assert "default final responses" in result
+
+
+@pytest.mark.asyncio
+async def test_gateway_commands_mentions_xyra_summary_when_enabled():
+    runner = _make_runner()
+    runner._xyra_summary_enabled = True
+    runner._xyra_summary_opt_in_required = False
+    runner._xyra_summary_opt_in_token = "/sum4xyra"
+
+    result = await runner._handle_commands_command(_make_event("/commands"))
+
+    assert "Xyra Summary" in result
+    assert "`/sum4xyra`" in result

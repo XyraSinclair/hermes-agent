@@ -52,6 +52,7 @@ from agent.xyra_summary import (
     format_summary_block,
     parse_summary_directive,
     summarize_for_xyra_sync,
+    summary_help_entries,
 )
 
 logger = logging.getLogger(__name__)
@@ -4601,6 +4602,18 @@ class HermesCLI:
             for cmd, info in sorted(_skill_commands.items()):
                 ChatConsole().print(
                     f"    [bold {_accent_hex()}]{cmd:<22}[/] [dim]-[/] {_escape(info['description'])}"
+                )
+
+        xyra_entries = summary_help_entries(
+            token=getattr(self, "_xyra_summary_opt_in_token", "/sum4xyra"),
+            enabled=getattr(self, "_xyra_summary_enabled", False),
+            opt_in_required=getattr(self, "_xyra_summary_opt_in_required", True),
+        )
+        if xyra_entries:
+            _cprint(f"\n  🧭 {_BOLD}Xyra Summary{_RST}")
+            for label, desc in xyra_entries:
+                ChatConsole().print(
+                    f"    [bold {_accent_hex()}]{label:<22}[/] [dim]-[/] {_escape(desc)}"
                 )
 
         _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")

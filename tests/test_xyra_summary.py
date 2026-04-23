@@ -3,7 +3,7 @@ from types import SimpleNamespace
 
 from cli import HermesCLI
 from gateway.run import GatewayRunner
-from agent.xyra_summary import parse_summary_directive
+from agent.xyra_summary import gateway_summary_help_lines, parse_summary_directive, summary_help_entries
 
 
 def test_parse_summary_directive_strips_trailing_suffix():
@@ -30,6 +30,23 @@ def test_parse_summary_directive_can_be_always_on_without_suffix():
     assert parsed.armed is True
     assert parsed.raw_directive is None
     assert parsed.sanitized_message == "catch me up"
+
+
+def test_summary_help_entries_describe_default_on_mode():
+    entries = summary_help_entries(enabled=True, opt_in_required=False)
+    assert any(label == "/sum4xyra" for label, _ in entries)
+    assert any(label == "default final responses" for label, _ in entries)
+
+
+def test_gateway_summary_help_lines_render_token_and_default_mode():
+    lines = gateway_summary_help_lines(enabled=True, opt_in_required=False)
+    joined = "\n".join(lines)
+    assert "`/sum4xyra`" in joined
+    assert "default final responses" in joined
+
+
+def test_gateway_summary_help_lines_hidden_when_disabled():
+    assert gateway_summary_help_lines(enabled=False) == []
 
 
 def test_cli_and_gateway_share_xyra_summary_parser_behavior():
