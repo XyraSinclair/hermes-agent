@@ -371,6 +371,18 @@ DEFAULT_CONFIG = {
         # Sends a status message every N seconds so the user knows the
         # agent hasn't died during long tasks.  0 = disable notifications.
         "gateway_notify_interval": 600,
+        # Optional second-pass human summary for busy operators. When armed via
+        # a trailing /sum4xyra suffix, Hermes asks an auxiliary model to rewrite
+        # the final response into a compact state/risk/next-move recap.
+        "xyra_summary": {
+            "enabled": False,
+            "opt_in_token": "/sum4xyra",
+            "opt_in_required": True,
+            "two_pass": True,
+            "max_context_messages": 8,
+            "max_chars_per_message": 1200,
+            "heading": "Xyra summary",
+        },
     },
     
     "terminal": {
@@ -536,6 +548,13 @@ DEFAULT_CONFIG = {
             "base_url": "",
             "api_key": "",
             "timeout": 30,
+        },
+        "xyra_summary": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
         },
     },
     
@@ -1939,6 +1958,11 @@ _VALID_CUSTOM_PROVIDER_FIELDS = {
 # Fields that look like they should be inside custom_providers, not at root
 _CUSTOM_PROVIDER_LIKE_FIELDS = {"base_url", "api_key", "rate_limit_delay", "api_mode"}
 
+_APPROVAL_GATED_AUTOMATIC_FALLBACK_MODELS = {
+    "gpt-5.4-pro",
+    "openai/gpt-5.4-pro",
+}
+
 
 @dataclass
 class ConfigIssue:
@@ -1964,6 +1988,15 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             return [ConfigIssue("error", "Could not load config.yaml", "Run 'hermes setup' to create a valid config")]
 
     issues: List[ConfigIssue] = []
+
+    def _check_approval_gated_fallback(location: str, entry: Dict[str, Any]) -> None:
+        model = str(entry.get("model", "")).strip()
+        if model.lower() in _APPROVAL_GATED_AUTOMATIC_FALLBACK_MODELS:
+            issues.append(ConfigIssue(
+                "error",
+                f"{location} uses approval-gated expensive model '{model}'",
+                "Remove it from automatic fallback config; invoke this model only by explicit local approval.",
+            ))
 
     # ── custom_providers must be a list, not a dict ──────────────────────
     cp = config.get("custom_providers")
@@ -2035,6 +2068,43 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
                     "fallback_model is missing 'model' field — fallback will be disabled",
                     "Add: model: anthropic/claude-sonnet-4 (or another model)",
                 ))
+            _check_approval_gated_fallback("fallback_model", fb)
+
+    # ── fallback_providers must be a list of provider/model entries ──────
+    fallback_providers = config.get("fallback_providers")
+    if fallback_providers is not None:
+        if not isinstance(fallback_providers, list):
+            issues.append(ConfigIssue(
+                "error",
+                f"fallback_providers should be a YAML list, got {type(fallback_providers).__name__}",
+                "Change to:\n"
+                "  fallback_providers:\n"
+                "    - provider: openrouter\n"
+                "      model: anthropic/claude-sonnet-4",
+            ))
+        else:
+            for i, entry in enumerate(fallback_providers):
+                location = f"fallback_providers[{i}]"
+                if not isinstance(entry, dict):
+                    issues.append(ConfigIssue(
+                        "warning",
+                        f"{location} is not a dict (got {type(entry).__name__})",
+                        "Each entry should have provider and model fields.",
+                    ))
+                    continue
+                if not entry.get("provider"):
+                    issues.append(ConfigIssue(
+                        "warning",
+                        f"{location} is missing 'provider' field — this fallback will be skipped",
+                        "Add: provider: openrouter (or another provider)",
+                    ))
+                if not entry.get("model"):
+                    issues.append(ConfigIssue(
+                        "warning",
+                        f"{location} is missing 'model' field — this fallback will be skipped",
+                        "Add: model: anthropic/claude-sonnet-4 (or another model)",
+                    ))
+                _check_approval_gated_fallback(location, entry)
 
     # ── Check for fallback_model accidentally nested inside custom_providers ──
     if isinstance(cp, dict) and "fallback_model" not in config and "fallback_model" in (cp or {}):
@@ -3602,6 +3672,17 @@ def config_command(args):
             print()
             print(color(f"  {len(missing_config)} new config option(s) available", Colors.YELLOW))
             print("    Run 'hermes config migrate' to add them")
+
+        structure_issues = validate_config_structure()
+        if structure_issues:
+            print()
+            print(color("  Config structure:", Colors.BOLD))
+            for ci in structure_issues:
+                marker = "✗" if ci.severity == "error" else "⚠"
+                color_name = Colors.RED if ci.severity == "error" else Colors.YELLOW
+                print(color(f"    {marker} {ci.message}", color_name))
+                for hint_line in ci.hint.splitlines():
+                    print(color(f"      {hint_line}", Colors.DIM))
         
         print()
     

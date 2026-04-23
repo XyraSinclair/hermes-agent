@@ -58,6 +58,14 @@ except (ImportError, AttributeError):
 import threading
 import queue
 
+from agent.xyra_summary import (
+    DEFAULT_BARE_SUMMARY_REQUEST,
+    SummaryDirective,
+    format_summary_block,
+    parse_summary_directive,
+    summarize_for_xyra_sync,
+    summary_help_entries,
+)
 from agent.usage_pricing import (
     CanonicalUsage,
     estimate_usage_cost,
@@ -1893,6 +1901,34 @@ class HermesCLI:
         self._auto_steward_notice = str(_notice_raw).strip().lower() not in (
             "0", "false", "no", "off"
         )
+        _opt_in_token_raw = _auto_steward_cfg.get(
+            "opt_in_token", os.getenv("HERMES_AUTO_STEWARD_OPT_IN_TOKEN", "\t")
+        )
+        _opt_in_required_raw = _auto_steward_cfg.get(
+            "opt_in_required", os.getenv("HERMES_AUTO_STEWARD_OPT_IN_REQUIRED", "1")
+        )
+        _opt_in_required = str(_opt_in_required_raw).strip().lower() not in (
+            "0", "false", "no", "off"
+        )
+        self._auto_steward_opt_in_token = (
+            str(_opt_in_token_raw) if _opt_in_required and _opt_in_token_raw is not None else ""
+        )
+        self._auto_steward_armed = False
+
+        _xyra_summary_cfg = (CLI_CONFIG.get("agent", {}) or {}).get("xyra_summary", {}) or {}
+        _xyra_summary_enabled = _xyra_summary_cfg.get("enabled", False)
+        self._xyra_summary_enabled = str(_xyra_summary_enabled).strip().lower() in (
+            "1", "true", "yes", "y", "on"
+        )
+        _xyra_summary_token = _xyra_summary_cfg.get("opt_in_token", "/sum4xyra")
+        self._xyra_summary_opt_in_token = str(_xyra_summary_token) if _xyra_summary_token is not None else ""
+        self._xyra_summary_opt_in_required = bool(_xyra_summary_cfg.get("opt_in_required", True))
+        self._xyra_summary_two_pass = bool(_xyra_summary_cfg.get("two_pass", True))
+        self._xyra_summary_max_context_messages = max(1, int(_xyra_summary_cfg.get("max_context_messages", 8) or 8))
+        self._xyra_summary_max_chars_per_message = max(200, int(_xyra_summary_cfg.get("max_chars_per_message", 1200) or 1200))
+        self._xyra_summary_heading = str(_xyra_summary_cfg.get("heading", "Xyra summary") or "Xyra summary")
+        self._xyra_summary_armed = False
+        self._xyra_summary_last_directive = SummaryDirective(armed=False, raw_directive=None, sanitized_message="")
 
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
@@ -1940,6 +1976,7 @@ class HermesCLI:
             "which would you like",
             "which do you want",
             "do you want me to",
+            "want me to",
             "would you like me to",
             "let me know if you'd like",
             "let me know if you want",
@@ -1966,6 +2003,9 @@ class HermesCLI:
             return False
         terminal_markers = (
             "stopping because",
+            "stopping: ",
+            "stopping —",
+            "stopping -",
             "remaining: none",
             "remaining: no concrete task",
             "remaining: none specified",
@@ -1987,6 +2027,42 @@ class HermesCLI:
             "Do not stop merely to narrate, summarize, or offer obvious next steps. Only stop when the work is genuinely complete, concretely blocked, or requires non-retrievable user input. If you stop, say why in one sentence."
         )
 
+    @staticmethod
+    def _normalize_auto_steward_text(message: Any) -> str:
+        if not isinstance(message, str):
+            return ""
+        return " ".join(message.split())
+
+    def _message_is_auto_steward_prompt(self, message: Any) -> bool:
+        return (
+            self._normalize_auto_steward_text(message)
+            == self._normalize_auto_steward_text(self._build_auto_steward_prompt())
+        )
+
+    def _message_contains_opt_in_token(self, message: Any) -> bool:
+        token = getattr(self, "_auto_steward_opt_in_token", "") or ""
+        if not token:
+            return True
+        if isinstance(message, str):
+            return token in message
+        if isinstance(message, list):
+            for part in message:
+                if isinstance(part, str) and token in part:
+                    return True
+                if isinstance(part, dict):
+                    text = part.get("text")
+                    if isinstance(text, str) and token in text:
+                        return True
+        return False
+
+    def _should_drop_unarmed_auto_steward_message(self, message: Any) -> bool:
+        token = getattr(self, "_auto_steward_opt_in_token", "") or ""
+        if not token:
+            return False
+        if not self._message_is_auto_steward_prompt(message):
+            return False
+        return not getattr(self, "_auto_steward_armed", False)
+
     def _should_auto_steward(self, response: str, result: Optional[Dict[str, Any]] = None) -> bool:
         if not self._auto_steward_enabled:
             return False
@@ -2000,7 +2076,71 @@ class HermesCLI:
             return False
         if self._response_looks_terminal(response):
             return False
+        token = getattr(self, "_auto_steward_opt_in_token", "") or ""
+        if token and not getattr(self, "_auto_steward_armed", False):
+            return False
         return True
+
+    def _parse_xyra_summary_directive(self, message: Any) -> SummaryDirective:
+        token = getattr(self, "_xyra_summary_opt_in_token", "/sum4xyra") or "/sum4xyra"
+        return parse_summary_directive(
+            message,
+            token=token,
+            opt_in_required=getattr(self, "_xyra_summary_opt_in_required", True),
+        )
+
+    def _should_generate_xyra_summary(self, decision: Any = None) -> bool:
+        if not getattr(self, "_xyra_summary_enabled", False):
+            return False
+        if not getattr(self, "_xyra_summary_armed", False):
+            return False
+        if decision and getattr(getattr(decision, "kind", None), "value", "") in {"continue", "redirect", "review"}:
+            return False
+        return True
+
+    def _build_xyra_summary_block(self, user_message: Any, response: str, decision: Any = None, result: Optional[Dict[str, Any]] = None) -> str:
+        if not self._should_generate_xyra_summary(decision):
+            return ""
+        if not response or not str(response).strip():
+            return ""
+        if result and (result.get("failed") or result.get("partial") or result.get("interrupted")):
+            return ""
+        try:
+            summary = summarize_for_xyra_sync(
+                user_message=user_message,
+                assistant_response=response,
+                conversation_history=getattr(self, "conversation_history", []),
+                max_context_messages=getattr(self, "_xyra_summary_max_context_messages", 8),
+                max_chars_per_message=getattr(self, "_xyra_summary_max_chars_per_message", 1200),
+                two_pass=getattr(self, "_xyra_summary_two_pass", True),
+            )
+        except Exception as e:
+            logger.debug("CLI Xyra summary generation failed: %s", e)
+            return ""
+        return format_summary_block(summary, heading=getattr(self, "_xyra_summary_heading", "Xyra summary"))
+
+    def _build_direct_xyra_summary(self, user_message: Any = None) -> str:
+        history = list(getattr(self, "conversation_history", []) or [])
+        assistant_messages = [m for m in history if isinstance(m, dict) and m.get("role") == "assistant"]
+        if not assistant_messages:
+            return "There is no prior assistant output in this chat to summarize yet."
+        assistant_response = str(assistant_messages[-1].get("content") or "").strip()
+        if not assistant_response:
+            return "There is no prior assistant output in this chat to summarize yet."
+        request = user_message or DEFAULT_BARE_SUMMARY_REQUEST
+        try:
+            summary = summarize_for_xyra_sync(
+                user_message=request,
+                assistant_response=assistant_response,
+                conversation_history=history,
+                max_context_messages=getattr(self, "_xyra_summary_max_context_messages", 8),
+                max_chars_per_message=getattr(self, "_xyra_summary_max_chars_per_message", 1200),
+                two_pass=getattr(self, "_xyra_summary_two_pass", True),
+            )
+        except Exception as e:
+            logger.debug("CLI direct Xyra summary generation failed: %s", e)
+            return "Xyra summary generation failed."
+        return summary.strip() or "Xyra summary generation returned no content."
 
     def _status_bar_context_style(self, percent_used: Optional[int]) -> str:
         if percent_used is None:
@@ -3913,6 +4053,18 @@ class HermesCLI:
             for cmd, info in sorted(_skill_commands.items()):
                 ChatConsole().print(
                     f"    [bold {_accent_hex()}]{cmd:<22}[/] [dim]-[/] {_escape(info['description'])}"
+                )
+
+        xyra_entries = summary_help_entries(
+            token=getattr(self, "_xyra_summary_opt_in_token", "/sum4xyra"),
+            enabled=getattr(self, "_xyra_summary_enabled", False),
+            opt_in_required=getattr(self, "_xyra_summary_opt_in_required", True),
+        )
+        if xyra_entries:
+            _cprint(f"\n  🧭 {_BOLD}Xyra Summary{_RST}")
+            for label, desc in xyra_entries:
+                ChatConsole().print(
+                    f"    [bold {_accent_hex()}]{label:<22}[/] [dim]-[/] {_escape(desc)}"
                 )
 
         _cprint(f"\n  {_DIM}Tip: Just type your message to chat with Hermes!{_RST}")
@@ -7812,6 +7964,21 @@ class HermesCLI:
         # register secure secret capture here as well.
         set_secret_capture_callback(self._secret_capture_callback)
 
+        if getattr(self, "_auto_steward_depth", 0) == 0:
+            self._auto_steward_armed = self._message_contains_opt_in_token(message)
+
+            summary_directive = self._parse_xyra_summary_directive(message)
+            self._xyra_summary_last_directive = summary_directive
+            self._xyra_summary_armed = summary_directive.armed
+            if summary_directive.armed and not (summary_directive.sanitized_message or "").strip() and summary_directive.raw_directive:
+                return self._build_direct_xyra_summary(DEFAULT_BARE_SUMMARY_REQUEST)
+            if summary_directive.armed and isinstance(message, str):
+                message = summary_directive.sanitized_message or message
+
+        if self._should_drop_unarmed_auto_steward_message(message):
+            logger.warning("Dropping leaked unarmed auto-steward prompt in CLI chat()")
+            return None
+
         # Refresh provider credentials if needed (handles key rotation transparently)
         if not self._ensure_runtime_credentials():
             return None
@@ -8136,6 +8303,10 @@ class HermesCLI:
                     response = response + "\n\n---\n_[Interrupted - processing new message]_"
 
             response_previewed = result.get("response_previewed", False) if result else False
+            summary_block = self._build_xyra_summary_block(message, response, None, result)
+            summary_panel_only = bool(summary_block and response_previewed)
+            if summary_block and not summary_panel_only:
+                response = f"{response}{summary_block}" if response else summary_block.lstrip()
 
             # Display reasoning (thinking) box if enabled and available.
             # Skip when streaming already showed reasoning live.  Use the
@@ -8195,6 +8366,18 @@ class HermesCLI:
                         box=rich_box.HORIZONTALS,
                         padding=(1, 4),
                     ))
+
+            if summary_panel_only and summary_block:
+                _chat_console = ChatConsole()
+                _chat_console.print(Panel(
+                    _rich_text_from_ansi(summary_block.strip()),
+                    title=f"[{_DIM} bold]{getattr(self, '_xyra_summary_heading', 'Xyra summary')}[/]",
+                    title_align="left",
+                    border_style="#888888",
+                    style="#DDDCDC",
+                    box=rich_box.HORIZONTALS,
+                    padding=(1, 4),
+                ))
 
 
             # Play terminal bell when agent finishes (if enabled).
@@ -9941,13 +10124,17 @@ class HermesCLI:
                             )
 
                     if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
-                        _cprint(f"\n⚙️  {user_input}")
-                        if not self.process_command(user_input):
-                            self._should_exit = True
-                            # Schedule app exit
-                            if app.is_running:
-                                app.exit()
-                        continue
+                        summary_directive = self._parse_xyra_summary_directive(user_input)
+                        if summary_directive.armed:
+                            user_input = user_input
+                        else:
+                            _cprint(f"\n⚙️  {user_input}")
+                            if not self.process_command(user_input):
+                                self._should_exit = True
+                                # Schedule app exit
+                                if app.is_running:
+                                    app.exit()
+                            continue
                     
                     # Expand paste references back to full content
                     import re as _re
@@ -10366,6 +10553,29 @@ def main(
     # Handle single query mode
     if query or image:
         query, single_query_images = _collect_query_images(query, image)
+        parsed_summary_directive = cli._parse_xyra_summary_directive(query) if query else None
+        bare_summary_directive = bool(
+            parsed_summary_directive
+            and parsed_summary_directive.armed
+            and (parsed_summary_directive.raw_directive is not None)
+            and not (parsed_summary_directive.sanitized_message or "").strip()
+            and not single_query_images
+        )
+        local_xyra_summary_query = bool(
+            parsed_summary_directive
+            and parsed_summary_directive.armed
+            and not single_query_images
+        )
+        if bare_summary_directive or local_xyra_summary_query:
+            if quiet:
+                cli.tool_progress_mode = "off"
+            response = cli.chat(query)
+            if response:
+                print(response)
+            if quiet:
+                print(f"\nsession_id: {cli.session_id}")
+                sys.exit(0 if response is not None else 1)
+            return
         if quiet:
             # Quiet mode: suppress banner, spinner, tool previews.
             # Only print the final response and parseable session info.
