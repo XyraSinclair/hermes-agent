@@ -229,6 +229,9 @@ def test_main_quiet_single_query_bare_directive_uses_chat_local_path(monkeypatch
         def _parse_auto_steward_directive(self, query):
             return SimpleNamespace(armed=True, sanitized_message="")
 
+        def _parse_xyra_summary_directive(self, query):
+            return SimpleNamespace(armed=False, raw_directive=None, sanitized_message=query)
+
         def _ensure_runtime_credentials(self):
             raise AssertionError("quiet single-query bare /asN should not pre-init credentials")
 
@@ -242,6 +245,42 @@ def test_main_quiet_single_query_bare_directive_uses_chat_local_path(monkeypatch
     output = capsys.readouterr().out
     assert "Auto-steward armed for 5 hops" in output
     assert "session_id: sess-123" in output
+
+
+def test_main_quiet_single_query_bare_sum4xyra_uses_chat_local_path(monkeypatch, capsys):
+    created = {}
+
+    class FakeCLI:
+        def __init__(self, *args, **kwargs):
+            self.tool_progress_mode = "all"
+            self.session_id = "sess-sum"
+            self.chat_calls = []
+            self.console = SimpleNamespace(print=lambda *a, **k: None)
+            created["cli"] = self
+
+        def chat(self, query):
+            self.chat_calls.append(query)
+            return "Bottom line\n- summary"
+
+        def _parse_auto_steward_directive(self, query):
+            return SimpleNamespace(armed=False, sanitized_message=query)
+
+        def _parse_xyra_summary_directive(self, query):
+            return SimpleNamespace(armed=True, raw_directive="/sum4xyra", sanitized_message="")
+
+        def _ensure_runtime_credentials(self):
+            raise AssertionError("quiet single-query bare /sum4xyra should not pre-init credentials")
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+
+    with pytest.raises(SystemExit) as excinfo:
+        cli_mod.main(query="/sum4xyra", quiet=True)
+
+    assert excinfo.value.code == 0
+    assert created["cli"].chat_calls == ["/sum4xyra"]
+    output = capsys.readouterr().out
+    assert "Bottom line" in output
+    assert "session_id: sess-sum" in output
 
 
 def test_main_single_query_bare_directive_prints_local_notice(monkeypatch, capsys):
@@ -267,6 +306,9 @@ def test_main_single_query_bare_directive_prints_local_notice(monkeypatch, capsy
 
         def _parse_auto_steward_directive(self, query):
             return SimpleNamespace(armed=True, sanitized_message="")
+
+        def _parse_xyra_summary_directive(self, query):
+            return SimpleNamespace(armed=False, raw_directive=None, sanitized_message=query)
 
         def _ensure_runtime_credentials(self):
             raise AssertionError("bare /asN should not pre-init credentials")

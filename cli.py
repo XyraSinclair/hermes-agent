@@ -46,6 +46,13 @@ from autosteward.prompts import (
 )
 from autosteward.reviewer import review_decision_sync
 from autosteward.state import AutoStewardConfig, ParsedDirective
+from agent.xyra_summary import (
+    DEFAULT_BARE_SUMMARY_REQUEST,
+    SummaryDirective,
+    format_summary_block,
+    parse_summary_directive,
+    summarize_for_xyra_sync,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -2161,6 +2168,21 @@ class HermesCLI:
         self._auto_steward_last_decision = None
         self._auto_steward_pending_directive = None
 
+        _xyra_summary_cfg = (CLI_CONFIG.get("agent", {}) or {}).get("xyra_summary", {}) or {}
+        _xyra_summary_enabled = _xyra_summary_cfg.get("enabled", False)
+        self._xyra_summary_enabled = str(_xyra_summary_enabled).strip().lower() in (
+            "1", "true", "yes", "y", "on"
+        )
+        _xyra_summary_token = _xyra_summary_cfg.get("opt_in_token", "/sum4xyra")
+        self._xyra_summary_opt_in_token = str(_xyra_summary_token) if _xyra_summary_token is not None else ""
+        self._xyra_summary_opt_in_required = bool(_xyra_summary_cfg.get("opt_in_required", True))
+        self._xyra_summary_two_pass = bool(_xyra_summary_cfg.get("two_pass", True))
+        self._xyra_summary_max_context_messages = max(1, int(_xyra_summary_cfg.get("max_context_messages", 8) or 8))
+        self._xyra_summary_max_chars_per_message = max(200, int(_xyra_summary_cfg.get("max_chars_per_message", 1200) or 1200))
+        self._xyra_summary_heading = str(_xyra_summary_cfg.get("heading", "Xyra summary") or "Xyra summary")
+        self._xyra_summary_armed = False
+        self._xyra_summary_last_directive = SummaryDirective(armed=False, raw_directive=None, sanitized_message="")
+
     def _invalidate(self, min_interval: float = 0.25) -> None:
         """Throttled UI repaint — prevents terminal blinking on slow/SSH connections."""
         now = time.monotonic()
@@ -2298,6 +2320,67 @@ class HermesCLI:
         if parsed.armed:
             return "Continue from the existing context and execute the highest-leverage safe next steps now."
         return parsed.sanitized_message
+
+    def _parse_xyra_summary_directive(self, message: Any) -> SummaryDirective:
+        token = getattr(self, "_xyra_summary_opt_in_token", "/sum4xyra") or "/sum4xyra"
+        return parse_summary_directive(
+            message,
+            token=token,
+            opt_in_required=getattr(self, "_xyra_summary_opt_in_required", True),
+        )
+
+    def _should_generate_xyra_summary(self, decision: Any = None) -> bool:
+        if not getattr(self, "_xyra_summary_enabled", False):
+            return False
+        if not getattr(self, "_xyra_summary_armed", False):
+            return False
+        if decision and getattr(getattr(decision, "kind", None), "value", "") in {"continue", "redirect", "review"}:
+            return False
+        return True
+
+    def _build_xyra_summary_block(self, user_message: Any, response: str, decision: Any = None, result: Optional[Dict[str, Any]] = None) -> str:
+        if not self._should_generate_xyra_summary(decision):
+            return ""
+        if not response or not str(response).strip():
+            return ""
+        if result and (result.get("failed") or result.get("partial") or result.get("interrupted")):
+            return ""
+        try:
+            summary = summarize_for_xyra_sync(
+                user_message=user_message,
+                assistant_response=response,
+                conversation_history=getattr(self, "conversation_history", []),
+                max_context_messages=getattr(self, "_xyra_summary_max_context_messages", 8),
+                max_chars_per_message=getattr(self, "_xyra_summary_max_chars_per_message", 1200),
+                two_pass=getattr(self, "_xyra_summary_two_pass", True),
+            )
+        except Exception as e:
+            logger.debug("CLI Xyra summary generation failed: %s", e)
+            return ""
+        return format_summary_block(summary, heading=getattr(self, "_xyra_summary_heading", "Xyra summary"))
+
+    def _build_direct_xyra_summary(self, user_message: Any = None) -> str:
+        history = list(getattr(self, "conversation_history", []) or [])
+        assistant_messages = [m for m in history if isinstance(m, dict) and m.get("role") == "assistant"]
+        if not assistant_messages:
+            return "There is no prior assistant output in this chat to summarize yet."
+        assistant_response = str(assistant_messages[-1].get("content") or "").strip()
+        if not assistant_response:
+            return "There is no prior assistant output in this chat to summarize yet."
+        request = user_message or DEFAULT_BARE_SUMMARY_REQUEST
+        try:
+            summary = summarize_for_xyra_sync(
+                user_message=request,
+                assistant_response=assistant_response,
+                conversation_history=history,
+                max_context_messages=getattr(self, "_xyra_summary_max_context_messages", 8),
+                max_chars_per_message=getattr(self, "_xyra_summary_max_chars_per_message", 1200),
+                two_pass=getattr(self, "_xyra_summary_two_pass", True),
+            )
+        except Exception as e:
+            logger.debug("CLI direct Xyra summary generation failed: %s", e)
+            return "Xyra summary generation failed."
+        return summary.strip() or "Xyra summary generation returned no content."
 
     def _should_drop_unarmed_auto_steward_message(self, message: Any) -> bool:
         token = getattr(self, "_auto_steward_opt_in_token", "") or ""
@@ -8598,6 +8681,13 @@ class HermesCLI:
                 directive=parsed_directive,
                 previous=getattr(self, "_auto_steward_episode", None),
             )
+            summary_directive = self._parse_xyra_summary_directive(message)
+            self._xyra_summary_last_directive = summary_directive
+            self._xyra_summary_armed = summary_directive.armed
+            if summary_directive.armed and not (summary_directive.sanitized_message or "").strip() and summary_directive.raw_directive:
+                return self._build_direct_xyra_summary(DEFAULT_BARE_SUMMARY_REQUEST)
+            if summary_directive.armed and isinstance(message, str):
+                message = summary_directive.sanitized_message or message
             if parsed_directive.warnings:
                 for warning in parsed_directive.warnings:
                     logger.info("CLI auto-steward directive warning: %s", warning)
@@ -8974,7 +9064,14 @@ class HermesCLI:
                 if response and pending_message:
                     response = response + "\n\n---\n_[Interrupted - processing new message]_"
 
+            decision = None
+            if not pending_message:
+                decision = self._decide_auto_steward(response, result)
             response_previewed = result.get("response_previewed", False) if result else False
+            summary_block = self._build_xyra_summary_block(message, response, decision, result)
+            summary_panel_only = bool(summary_block and response_previewed)
+            if summary_block and not summary_panel_only:
+                response = f"{response}{summary_block}" if response else summary_block.lstrip()
 
             # Display reasoning (thinking) box if enabled and available.
             # Skip when streaming already showed reasoning live.  Use the
@@ -9035,6 +9132,17 @@ class HermesCLI:
                         padding=(1, 4),
                     ))
 
+            if summary_panel_only and summary_block:
+                _chat_console = ChatConsole()
+                _chat_console.print(Panel(
+                    _render_final_assistant_content(summary_block.strip(), mode=self.final_response_markdown),
+                    title=f"[{_DIM} bold]{getattr(self, '_xyra_summary_heading', 'Xyra summary')}[/]",
+                    title_align="left",
+                    border_style="#888888",
+                    style="#DDDCDC",
+                    box=rich_box.HORIZONTALS,
+                    padding=(1, 4),
+                ))
 
             # Play terminal bell when agent finishes (if enabled).
             # Works over SSH — the bell propagates to the user's terminal.
@@ -9067,9 +9175,6 @@ class HermesCLI:
                 "response": str(response or "")[:500],
             })
 
-            decision = None
-            if not pending_message:
-                decision = self._decide_auto_steward(response, result)
             if decision and decision.kind.value in ("continue", "redirect", "review"):
                 if self._auto_steward_notice:
                     reasons = ", ".join(decision.reason_codes) if decision.reason_codes else "unspecified"
@@ -10905,9 +11010,12 @@ class HermesCLI:
 
                     if not _file_drop and isinstance(user_input, str) and _looks_like_slash_command(user_input):
                         parsed_directive = self._parse_auto_steward_directive(user_input)
+                        summary_directive = self._parse_xyra_summary_directive(user_input)
                         if parsed_directive.armed:
                             self._auto_steward_pending_directive = parsed_directive
                             user_input = self._coerce_auto_steward_message(parsed_directive)
+                        elif summary_directive.armed:
+                            user_input = user_input
                         else:
                             _cprint(f"\n⚙️  {user_input}")
                             if not self.process_command(user_input):
@@ -11362,13 +11470,21 @@ def main(
     if query or image:
         query, single_query_images = _collect_query_images(query, image)
         parsed_directive = cli._parse_auto_steward_directive(query) if query else None
+        parsed_summary_directive = cli._parse_xyra_summary_directive(query) if query else None
         bare_directive = bool(
             parsed_directive
             and parsed_directive.armed
             and not (parsed_directive.sanitized_message or "").strip()
             and not single_query_images
         )
-        if bare_directive:
+        bare_summary_directive = bool(
+            parsed_summary_directive
+            and parsed_summary_directive.armed
+            and (parsed_summary_directive.raw_directive is not None)
+            and not (parsed_summary_directive.sanitized_message or "").strip()
+            and not single_query_images
+        )
+        if bare_directive or bare_summary_directive:
             if quiet:
                 cli.tool_progress_mode = "off"
             response = cli.chat(query)

@@ -413,6 +413,18 @@ DEFAULT_CONFIG = {
             "max_reviews_per_episode": 2,
             "log_episodes": True,
         },
+        # Optional second-pass human summary for busy operators. When armed via
+        # a trailing /sum4xyra suffix, Hermes asks an auxiliary model to rewrite
+        # the final response into a compact state/risk/next-move recap.
+        "xyra_summary": {
+            "enabled": False,
+            "opt_in_token": "/sum4xyra",
+            "opt_in_required": True,
+            "two_pass": True,
+            "max_context_messages": 8,
+            "max_chars_per_message": 1200,
+            "heading": "Xyra summary",
+        },
     },
     
     "terminal": {
@@ -612,6 +624,14 @@ DEFAULT_CONFIG = {
             "base_url": "",
             "api_key": "",
             "timeout": 30,
+            "extra_body": {},
+        },
+        "xyra_summary": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
             "extra_body": {},
         },
     },
